@@ -4,7 +4,18 @@
     android:layout_height="match_parent"
     android:orientation="vertical"
     android:gravity="center"
-    android:padding="24dp">
+    android:padding="24dp"
+    android:background="#121212"> <!-- fond sombre -->
+
+    <TextView
+        android:id="@+id/statusText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="GPS Sender stopped"
+        android:textSize="18sp"
+        android:textColor="@android:color/white"
+        android:layout_marginBottom="32dp"
+        android:padding="8dp" />
 
     <Button
         android:id="@+id/startButton"
@@ -18,12 +29,4 @@
         android:layout_height="wrap_content"
         android:text="Stop GPS Sender"
         android:layout_marginTop="16dp"/>
-    <TextView
-        android:id="@+id/statusText"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="GPS Sender stopped"
-        android:textSize="18sp"
-        android:textColor="#333333"
-        android:layout_marginBottom="32dp" />
 </LinearLayout>

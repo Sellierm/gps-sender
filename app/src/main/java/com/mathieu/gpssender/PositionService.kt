@@ -1,100 +1,82 @@
 package com.mathieu.gpssender
 
-import android.Manifest
 import android.app.*
+import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.os.Build
 import android.os.IBinder
-import android.os.Looper
 import android.util.Log
-import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
-import com.google.android.gms.location.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
-import java.util.concurrent.TimeUnit
+import android.content.pm.PackageManager
+
 
 class PositionService : Service() {
 
-    private lateinit var fusedLocationClient: FusedLocationProviderClient
-    private lateinit var locationCallback: LocationCallback
-    private val client = OkHttpClient()
+    private val TAG = "GPS_SENDER_LOG"
+    private lateinit var locationManager: LocationManager
+    private lateinit var locationListener: LocationListener
+
+    private val httpClient = OkHttpClient()
+
+    private val NOTIFICATION_ID = 1
+    private val CHANNEL_ID = "PositionServiceChannel"
 
     override fun onCreate() {
         super.onCreate()
-        Log.d("GPS_SENDER", "Service created")
-        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
-        startForeground(1, buildNotification())
-        startLocationUpdates()
-    }
+        Log.d(TAG, "PositionService onCreate()")
 
-    private fun buildNotification(): Notification {
-        val channelId = "gps_channel"
-        val channelName = "GPS Tracking"
+        createNotificationChannel()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val chan = NotificationChannel(channelId, channelName, NotificationManager.IMPORTANCE_LOW)
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(chan)
+        locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        locationListener = LocationListener { location ->
+            if (location != null) {
+                val message = "Lat: ${location.latitude}, Lon: ${location.longitude}"
+                Log.d(TAG, message)
+                updateNotification(message)
+                sendLocation(location)
+            }
         }
-
-        val stopIntent = PendingIntent.getService(
-            this, 0,
-            Intent(this, PositionService::class.java).apply { action = "STOP_SERVICE" },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        return NotificationCompat.Builder(this, channelId)
-            .setContentTitle("GPS Sender actif")
-            .setContentText("Transmission de la position")
-            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
-            .addAction(android.R.drawable.ic_delete, "Stop", stopIntent)
-            .build()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == "STOP_SERVICE") {
-            stopForeground(true)
+        Log.d(TAG, "PositionService onStartCommand()")
+
+        val notification = createNotification("Service en cours…")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+
+        try {
+            val hasFineLocation = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            if (hasFineLocation) {
+                locationManager.requestLocationUpdates(
+                    LocationManager.GPS_PROVIDER,
+                    5000L, // intervalle 5 sec
+                    0f, // distance minimale
+                    locationListener
+                )
+                Log.d(TAG, "Mises à jour GPS activées via LocationManager")
+            } else {
+                Log.e(TAG, "Permission ACCESS_FINE_LOCATION manquante")
+                stopSelf()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Erreur lors du démarrage du GPS", e)
             stopSelf()
         }
+
         return START_STICKY
-    }
-
-    private fun startLocationUpdates() {
-        val locationRequest = LocationRequest.Builder(
-            Priority.PRIORITY_HIGH_ACCURACY,
-            TimeUnit.MINUTES.toMillis(1)
-        ).build()
-
-        if (ActivityCompat.checkSelfPermission(
-                this,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            ) != PackageManager.PERMISSION_GRANTED &&
-            ActivityCompat.checkSelfPermission(
-                this,
-                Manifest.permission.ACCESS_COARSE_LOCATION
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            Log.d("GPS_SENDER", "Location permissions not granted")
-            return
-        }
-
-        locationCallback = object : LocationCallback() {
-            override fun onLocationResult(result: LocationResult) {
-                result.lastLocation?.let { sendLocation(it) }
-            }
-        }
-
-        fusedLocationClient.requestLocationUpdates(
-            locationRequest,
-            locationCallback,
-            Looper.getMainLooper()
-        )
     }
 
     private fun sendLocation(location: Location) {
@@ -103,32 +85,52 @@ class PositionService : Service() {
                 val json = JSONObject().apply {
                     put("latitude", location.latitude)
                     put("longitude", location.longitude)
-                    put("id", "")
+                    put("id", "6290")
                     put("timestamp", System.currentTimeMillis())
-
+                    put("key", "yVi9gGEvcL2E")
                 }
 
                 val body = json.toString().toRequestBody("application/json".toMediaTypeOrNull())
-
                 val request = Request.Builder()
-                    .url("")
+                    .url("https://sellier.alwaysdata.net/api/location")
                     .post(body)
                     .build()
 
-                client.newCall(request).execute().use { response ->
-                    Log.d("GPS_SENDER", "Position envoyée: ${response.code}")
+                httpClient.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) Log.i(TAG, "Position envoyée : ${response.code}")
+                    else Log.e(TAG, "Erreur envoi : ${response.code} - ${response.body?.string()}")
                 }
             } catch (e: Exception) {
-                e.printStackTrace()
+                Log.e(TAG, "Erreur lors de l'envoi de la position", e)
             }
         }.start()
     }
 
-    override fun onDestroy() {
-        if (::locationCallback.isInitialized) {
-            fusedLocationClient.removeLocationUpdates(locationCallback)
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(CHANNEL_ID, "Service GPS", NotificationManager.IMPORTANCE_LOW)
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(channel)
         }
+    }
+
+    private fun createNotification(text: String) =
+        NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("GPS Sender")
+            .setContentText(text)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setOngoing(true)
+            .build()
+
+    private fun updateNotification(text: String) {
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(NOTIFICATION_ID, createNotification(text))
+    }
+
+    override fun onDestroy() {
         super.onDestroy()
+        locationManager.removeUpdates(locationListener)
+        Log.d(TAG, "PositionService détruit, GPS arrêté")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
