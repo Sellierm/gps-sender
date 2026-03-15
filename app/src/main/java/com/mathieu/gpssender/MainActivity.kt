@@ -64,8 +64,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        Log.d(TAG, "Permission ACCESS_FINE_LOCATION déjà accordée")
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val backgroundLocationGranted = ContextCompat.checkSelfPermission(
                 this, Manifest.permission.ACCESS_BACKGROUND_LOCATION
@@ -75,7 +73,7 @@ class MainActivity : AppCompatActivity() {
                 Log.w(TAG, "Permission ACCESS_BACKGROUND_LOCATION manquante")
                 AlertDialog.Builder(this)
                     .setTitle("Permission en arrière-plan nécessaire")
-                    .setMessage("Veuillez autoriser le suivi permanent dans les paramètres pour que le service fonctionne au démarrage.")
+                    .setMessage("Veuillez autoriser le suivi permanent dans les paramètres.")
                     .setPositiveButton("Aller aux paramètres") { _, _ ->
                         val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
                         intent.data = Uri.fromParts("package", packageName, null)
@@ -85,12 +83,13 @@ class MainActivity : AppCompatActivity() {
                     .show()
                 return
             }
-            Log.d(TAG, "Permission ACCESS_BACKGROUND_LOCATION accordée")
         }
 
-        checkLocationEnabledAndStart()
+        // On démarre directement sans vérifier le GPS interne
+        // car la tablette CHCNAV utilise le port série /dev/tty3 ou /dev/tty4
+        Log.d(TAG, "Démarrage direct du service (port série RTK)")
+        startGPSService()
     }
-
     private fun checkLocationEnabledAndStart() {
         val locationRequest = LocationRequest.Builder(
             Priority.PRIORITY_HIGH_ACCURACY,

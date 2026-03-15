@@ -5,9 +5,7 @@ plugins {
 
 android {
     namespace = "com.mathieu.gpssender"
-    compileSdk {
-        version = release(36)
-    }
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.mathieu.gpssender"
@@ -48,4 +46,5 @@ dependencies {
     androidTestImplementation(libs.androidx.espresso.core)
     implementation("com.google.android.gms:play-services-location:21.0.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // Supprime les deux lignes licheedev — FileInputStream suffit
 }
