@@ -23,9 +23,9 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        buildConfigField("String", "API_KEY", "\"${localProperties.getProperty("API_KEY") ?: error("API_KEY is not set in local.properties")}\"")
-        buildConfigField("String", "API_URL", "\"${localProperties.getProperty("API_URL") ?: error("API_URL is not set in local.properties")}\"")
-        buildConfigField("String", "DEVICE_ID", "\"${localProperties.getProperty("DEVICE_ID") ?: error("DEVICE_ID is not set in local.properties")}\"")
+        buildConfigField("String", "API_KEY", "\"${localProperties.getProperty("API_KEY") ?: ""}\"")
+        buildConfigField("String", "API_URL", "\"${localProperties.getProperty("API_URL") ?: ""}\"")
+        buildConfigField("String", "DEVICE_ID", "\"${localProperties.getProperty("DEVICE_ID") ?: ""}\"")
     }
 
     buildFeatures {

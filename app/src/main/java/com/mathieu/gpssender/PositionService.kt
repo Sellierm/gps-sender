@@ -384,6 +384,10 @@ class PositionService : Service() {
     }
 
     private fun sendLocation(location: Location, source: String) {
+        if (BuildConfig.API_URL.isBlank() || BuildConfig.API_KEY.isBlank() || BuildConfig.DEVICE_ID.isBlank()) {
+            Log.w(logTag, "API_URL, API_KEY, or DEVICE_ID is not configured — skipping HTTP send. Set values in local.properties.")
+            return
+        }
         Thread {
             try {
                 val json = JSONObject().apply {
