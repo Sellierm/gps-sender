@@ -1,6 +1,13 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
+}
+
+val localProperties = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.exists()) load(file.inputStream())
 }
 
 android {
@@ -15,6 +22,14 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        buildConfigField("String", "API_KEY", "\"${localProperties.getProperty("API_KEY") ?: error("API_KEY is not set in local.properties")}\"")
+        buildConfigField("String", "API_URL", "\"${localProperties.getProperty("API_URL") ?: error("API_URL is not set in local.properties")}\"")
+        buildConfigField("String", "DEVICE_ID", "\"${localProperties.getProperty("DEVICE_ID") ?: error("DEVICE_ID is not set in local.properties")}\"")
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     buildTypes {

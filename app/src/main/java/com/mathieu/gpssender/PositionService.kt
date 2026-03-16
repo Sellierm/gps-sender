@@ -391,15 +391,15 @@ class PositionService : Service() {
                     put("longitude", location.longitude)
                     put("altitude", location.altitude)
                     put("accuracy", location.accuracy)
-                    put("id", "6290")
+                    put("id", BuildConfig.DEVICE_ID)
                     put("timestamp", System.currentTimeMillis())
-                    put("key", "yVi9gGEvcL2E")
+                    put("key", BuildConfig.API_KEY)
                     put("source", source)
                 }
 
                 val body = json.toString().toRequestBody("application/json".toMediaTypeOrNull())
                 val request = Request.Builder()
-                    .url("https://sellier.alwaysdata.net/api/location")
+                    .url(BuildConfig.API_URL)
                     .post(body)
                     .build()
 
