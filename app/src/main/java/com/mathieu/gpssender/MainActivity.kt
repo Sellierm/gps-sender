@@ -15,9 +15,6 @@ import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import com.google.android.gms.common.api.ResolvableApiException
-import com.google.android.gms.location.*
-
 
 class MainActivity : AppCompatActivity() {
 
@@ -42,6 +39,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         logDeviceInfo()
+
         statusText = findViewById(R.id.statusText)
         startButton = findViewById(R.id.startButton)
         stopButton = findViewById(R.id.stopButton)
@@ -51,6 +49,7 @@ class MainActivity : AppCompatActivity() {
 
         Log.d(TAG, "MainActivity créée et UI initialisée")
         updateStatus()
+        GpsWatchdogWorker.schedule(this)
     }
 
     private fun checkPermissionsAndStart() {
@@ -85,57 +84,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // On démarre directement sans vérifier le GPS interne
-        // car la tablette CHCNAV utilise le port série
+        // Démarrage direct sans vérifier le GPS interne
+        // La tablette CHCNAV utilise le port série /dev/ttyS4
         Log.d(TAG, "Démarrage direct du service (port série RTK)")
         startGPSService()
-    }
-    private fun checkLocationEnabledAndStart() {
-        val locationRequest = LocationRequest.Builder(
-            Priority.PRIORITY_HIGH_ACCURACY,
-            5000L
-        ).build()
-
-        val builder = LocationSettingsRequest.Builder()
-            .addLocationRequest(locationRequest)
-            .setAlwaysShow(true)
-
-        val client: SettingsClient = LocationServices.getSettingsClient(this)
-        val task = client.checkLocationSettings(builder.build())
-
-        task.addOnSuccessListener {
-            Log.d(TAG, "GPS activé, démarrage du service")
-            startGPSService()
-        }
-
-        task.addOnFailureListener { exception ->
-            if (exception is ResolvableApiException) {
-                try {
-                    exception.startResolutionForResult(this, 1001)
-                } catch (sendEx: Exception) {
-                    Log.e(TAG, "Impossible de lancer la popup GPS", sendEx)
-                    redirectToLocationSettings()
-                }
-            } else {
-                Log.w(TAG, "GPS désactivé, pas de popup disponible")
-                redirectToLocationSettings()
-            }
-        }
-    }
-
-    private fun redirectToLocationSettings() {
-        Log.d(TAG, "Redirection vers les paramètres de localisation")
-        statusText.text = "Veuillez activer les services de localisation."
-        val intent = Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)
-        startActivity(intent)
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == 1001) {
-            Log.d(TAG, "Retour popup GPS, vérification")
-            checkLocationEnabledAndStart()
-        }
     }
 
     private fun startGPSService() {
@@ -150,6 +102,7 @@ class MainActivity : AppCompatActivity() {
         stopService(intent)
         Log.d(TAG, "Service PositionService arrêté")
         updateStatus()
+        GpsWatchdogWorker.cancel(this)
     }
 
     private fun updateStatus() {
@@ -167,19 +120,10 @@ class MainActivity : AppCompatActivity() {
     }
 }
 
-
-
-
 fun logDeviceInfo() {
-    val manufacturer = Build.MANUFACTURER
-    val model = Build.MODEL
-    val device = Build.DEVICE
-    val sdkInt = Build.VERSION.SDK_INT
-    val release = Build.VERSION.RELEASE
-
-    Log.d("DEVICE_INFO", "Manufacturer: $manufacturer")
-    Log.d("DEVICE_INFO", "Model: $model")
-    Log.d("DEVICE_INFO", "Device: $device")
-    Log.d("DEVICE_INFO", "Android SDK: $sdkInt")
-    Log.d("DEVICE_INFO", "Android version: $release")
+    Log.d("DEVICE_INFO", "Manufacturer: ${Build.MANUFACTURER}")
+    Log.d("DEVICE_INFO", "Model: ${Build.MODEL}")
+    Log.d("DEVICE_INFO", "Device: ${Build.DEVICE}")
+    Log.d("DEVICE_INFO", "Android SDK: ${Build.VERSION.SDK_INT}")
+    Log.d("DEVICE_INFO", "Android version: ${Build.VERSION.RELEASE}")
 }
