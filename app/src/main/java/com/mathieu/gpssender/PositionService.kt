@@ -49,17 +49,17 @@ class PositionService : Service() {
 
     @Volatile private var isRunning = false
     @Volatile private var lastRtkTimestamp = 0L
-    @Volatile private var rtkActiveStartTimestamp = 0L  // quand le RTK est devenu actif
-    @Volatile private var internalGpsActive = true       // GPS interne allumé ou non
+    @Volatile private var rtkActiveStartTimestamp = 0L
+    @Volatile private var internalGpsActive = true
 
     private val lastSentTimestamp = AtomicLong(0L)
     private val RTK_PRIORITY_TIMEOUT_MS = 10_000L
-    private val RTK_GPS_CUTOFF_MS = 30_000L  // couper GPS interne après 30s de RTK stable
-    private val MIN_SEND_INTERVAL_MS = 2000L
-    private val MAX_SPEED_KMH = 200.0        // filtre positions aberrantes
+    private val RTK_GPS_CUTOFF_MS = 30_000L
+    private val MIN_SEND_INTERVAL_MS = 3000L
+    private val MAX_SPEED_KMH = 200.0
 
     // ─────────────────────────────────────────────
-    // File d'attente
+    // File d'attente locale (max 500 positions)
     // ─────────────────────────────────────────────
 
     data class PendingLocation(
@@ -69,8 +69,8 @@ class PositionService : Service() {
         val accuracy: Float,
         val timestamp: Long,
         val source: String,
-        val speed: Float = 0f,    // m/s depuis RMC
-        val heading: Float = 0f   // degrés depuis RMC
+        val speed: Float = 0f,
+        val heading: Float = 0f
     )
 
     private val sendQueue = LinkedBlockingQueue<PendingLocation>(500)
@@ -79,7 +79,7 @@ class PositionService : Service() {
     // Moyenne glissante sur 3 positions RTK
     // ─────────────────────────────────────────────
 
-    private val positionBuffer = ArrayDeque<PendingLocation>(3)
+    private val positionBuffer = ArrayDeque<PendingLocation>()
     private val SMOOTHING_COUNT = 3
 
     // ─────────────────────────────────────────────
@@ -103,7 +103,8 @@ class PositionService : Service() {
         "/dev/ttyUSB0",
         "/dev/ttyUSB1"
     )
-    private val BAUD_RATE = 460800
+    private val BAUD_RATE = 115200 //7724
+    //private val BAUD_RATE = 460800 //6290
 
     // ─────────────────────────────────────────────
     // Cycle de vie
@@ -202,16 +203,13 @@ class PositionService : Service() {
         }
     }
 
-    /**
-     * Appelé à chaque position RTK reçue pour gérer le cycle GPS interne.
-     */
     private fun updateRtkStatus() {
         val now = System.currentTimeMillis()
         lastRtkTimestamp = now
 
         if (rtkActiveStartTimestamp == 0L) {
             rtkActiveStartTimestamp = now
-            Log.d(logTag, "RTK actif — démarrage du compteur GPS cutoff")
+            Log.d(logTag, "RTK actif — démarrage compteur GPS cutoff")
         }
 
         val rtkDuration = now - rtkActiveStartTimestamp
@@ -220,12 +218,11 @@ class PositionService : Service() {
         }
     }
 
-    /**
-     * Appelé quand le RTK est perdu (timeout).
-     */
     private fun onRtkLost() {
         rtkActiveStartTimestamp = 0L
+        positionBuffer.clear() // vider le buffer de lissage
         restoreInternalGps()
+        Log.w(logTag, "RTK perdu — buffer de lissage vidé")
     }
 
     // ─────────────────────────────────────────────
@@ -233,13 +230,7 @@ class PositionService : Service() {
     // ─────────────────────────────────────────────
 
     private fun processLocation(raw: PendingLocation) {
-        // 1. Vérifier le timeout RTK pour restaurer le GPS interne si nécessaire
-        if (raw.source.startsWith("GPS Interne")) {
-            val rtkIsActive = (System.currentTimeMillis() - lastRtkTimestamp) < RTK_PRIORITY_TIMEOUT_MS
-            if (rtkIsActive) return // double sécurité
-        }
-
-        // 2. Filtre vitesse aberrante
+        // 1. Filtre vitesse aberrante
         val last = lastValidLocation
         if (last != null) {
             val distanceM = haversineDistance(last.latitude, last.longitude, raw.latitude, raw.longitude)
@@ -247,47 +238,49 @@ class PositionService : Service() {
             if (deltaMs > 0) {
                 val speedKmh = (distanceM / deltaMs) * 3600.0
                 if (speedKmh > MAX_SPEED_KMH) {
-                    Log.w(logTag, "Position aberrante ignorée: vitesse calculée ${String.format("%.1f", speedKmh)} km/h")
+                    Log.w(logTag, "Position aberrante ignorée: ${String.format("%.1f", speedKmh)} km/h")
                     return
                 }
             }
         }
 
-        // 3. Throttle
+        // 2. Smoothing AVANT le throttle — retourne null si buffer pas encore plein
+        val smoothed = if (raw.source.startsWith("RTK")) {
+            smoothPosition(raw) ?: return // Pas encore SMOOTHING_COUNT points, on attend sans toucher au timestamp
+        } else {
+            raw
+        }
+
+        // 3. Throttle uniquement sur les positions qui passeront vraiment
         val now = System.currentTimeMillis()
         if (now - lastSentTimestamp.get() < MIN_SEND_INTERVAL_MS) {
             Log.d(logTag, "Throttle: ignoré (${raw.source})")
             return
         }
         lastSentTimestamp.set(now)
-        lastValidLocation = raw
+        lastValidLocation = smoothed
 
-        // 4. Moyenne glissante (seulement pour RTK)
-        val toSend = if (raw.source.startsWith("RTK")) {
-            smoothPosition(raw)
-        } else {
-            raw
-        }
-
-        // 5. Mise en file
-        val queued = sendQueue.offer(toSend)
+        // 4. Mise en file
+        val queued = sendQueue.offer(smoothed)
         if (!queued) {
-            Log.w(logTag, "File pleine, position ignorée")
+            Log.w(logTag, "File pleine (500), position ignorée")
         } else {
             val queueInfo = if (sendQueue.size > 1) " | file: ${sendQueue.size}" else ""
-            val notifText = "${toSend.source} | ${String.format("%.7f", toSend.latitude)}, " +
-                    "${String.format("%.7f", toSend.longitude)}$queueInfo"
-            updateNotification(notifText)
+            updateNotification(
+                "${smoothed.source} | ${String.format("%.7f", smoothed.latitude)}, " +
+                        "${String.format("%.7f", smoothed.longitude)}$queueInfo"
+            )
         }
     }
 
     /**
      * Moyenne glissante sur SMOOTHING_COUNT positions.
+     * Retourne null si le buffer n'est pas encore plein.
      */
-    private fun smoothPosition(pos: PendingLocation): PendingLocation {
+    private fun smoothPosition(pos: PendingLocation): PendingLocation? {
         positionBuffer.addLast(pos)
         if (positionBuffer.size > SMOOTHING_COUNT) positionBuffer.removeFirst()
-        if (positionBuffer.size < SMOOTHING_COUNT) return pos // pas encore assez de points
+        if (positionBuffer.size < SMOOTHING_COUNT) return null
 
         val avgLat = positionBuffer.map { it.latitude }.average()
         val avgLon = positionBuffer.map { it.longitude }.average()
@@ -319,7 +312,7 @@ class PositionService : Service() {
 
             while (isRunning) {
                 try {
-                    // Vérifier si RTK perdu (restaurer GPS interne)
+                    // Vérifier si RTK perdu
                     val rtkIsActive = (System.currentTimeMillis() - lastRtkTimestamp) < RTK_PRIORITY_TIMEOUT_MS
                     if (!rtkIsActive && rtkActiveStartTimestamp != 0L) {
                         onRtkLost()
@@ -346,7 +339,7 @@ class PositionService : Service() {
                 } catch (e: InterruptedException) {
                     break
                 } catch (e: Exception) {
-                    Log.e(logTag, "Erreur thread envoi", e)
+                    Log.e(logTag, "Erreur thread envoi [${e.javaClass.simpleName}]: ${e.message}")
                 }
             }
             Log.d(logTag, "Thread d'envoi arrêté")
@@ -369,8 +362,8 @@ class PositionService : Service() {
                 put("longitude", pending.longitude)
                 put("altitude", pending.altitude)
                 put("accuracy", pending.accuracy)
-                put("speed", pending.speed)         // m/s
-                put("heading", pending.heading)     // degrés
+                put("speed", pending.speed)
+                put("heading", pending.heading)
                 put("id", BuildConfig.DEVICE_ID)
                 put("timestamp", pending.timestamp)
                 put("key", BuildConfig.API_KEY)
@@ -385,7 +378,7 @@ class PositionService : Service() {
 
             httpClient.newCall(request).execute().use { response ->
                 if (response.isSuccessful) {
-                    Log.i(logTag, "Envoye (${pending.source}) HTTP ${response.code} | speed=${pending.speed}m/s heading=${pending.heading}°")
+                    Log.i(logTag, "Envoye (${pending.source}) HTTP ${response.code} | speed=${String.format("%.2f", pending.speed)}m/s heading=${String.format("%.1f", pending.heading)}°")
                     true
                 } else {
                     Log.e(logTag, "Erreur HTTP ${response.code}")
@@ -449,8 +442,12 @@ class PositionService : Service() {
             val cmd = "stty -F $path $baudRate raw -echo -echoe -echok -echoctl -echoke cs8 -cstopb -parenb -crtscts"
             val process = Runtime.getRuntime().exec(arrayOf("/system/bin/sh", "-c", cmd))
             val exitCode = process.waitFor()
-            if (exitCode == 0) Log.i(logTag, "Port $path configuré : $baudRate baud")
-            else Log.w(logTag, "stty exit=$exitCode : ${process.errorStream.bufferedReader().readText()}")
+            if (exitCode == 0) {
+                Log.i(logTag, "Port $path configuré : $baudRate baud")
+            } else {
+                val error = process.errorStream.bufferedReader().readText()
+                Log.w(logTag, "stty exit=$exitCode : $error")
+            }
         } catch (e: Exception) {
             Log.e(logTag, "Erreur stty sur $path", e)
         }
@@ -475,6 +472,7 @@ class PositionService : Service() {
 
                     sb.append(String(buffer, 0, size, Charsets.US_ASCII))
 
+                    // Parser sur $ — compatible \r, \n, \r\n
                     var processing = true
                     while (processing) {
                         val start = sb.indexOf("$")
@@ -496,9 +494,10 @@ class PositionService : Service() {
                         }
                     }
 
+                    // Heartbeat toutes les 10s
                     val now = System.currentTimeMillis()
                     if (now - lastHeartbeat > 10_000L) {
-                        Log.d(logTag, "Thread série actif sur $path | file: ${sendQueue.size}")
+                        Log.d(logTag, "Thread série actif sur $path | file: ${sendQueue.size} | RTK: ${if ((now - lastRtkTimestamp) < RTK_PRIORITY_TIMEOUT_MS) "actif" else "inactif"}")
                         lastHeartbeat = now
                     }
 
@@ -543,6 +542,7 @@ class PositionService : Service() {
     /**
      * GGA : position, qualité fix, altitude
      * $GNGGA,hhmmss,Lat,N/S,Lon,E/W,quality,sats,HDOP,alt,M,...*XX
+     * Index :   0     1   2   3   4   5       6    7    8    9  10
      */
     private fun parseGga(line: String) {
         val parts = (if (line.contains("*")) line.substringBefore("*") else line).split(",")
@@ -556,10 +556,25 @@ class PositionService : Service() {
             val hdop = parts[8].toDoubleOrNull() ?: 0.0
             val altitude = parts[9].toDoubleOrNull() ?: 0.0
 
-            if (quality == "0") return
+            if (quality == "0") {
+                Log.d(logTag, "GGA reçu mais pas de fix (quality=0)")
+                return
+            }
 
-            val accuracy = when (quality) { "4" -> 0.02f; "5" -> 0.30f; "2" -> 1.0f; else -> 5.0f }
-            val qualityLabel = when (quality) { "4" -> "RTK Fix"; "5" -> "RTK Float"; "2" -> "DGPS"; "1" -> "GPS"; else -> "Fix=$quality" }
+            val accuracy = when (quality) {
+                "4" -> 0.02f
+                "5" -> 0.30f
+                "2" -> 1.0f
+                else -> 5.0f
+            }
+
+            val qualityLabel = when (quality) {
+                "4" -> "RTK Fix"
+                "5" -> "RTK Float"
+                "2" -> "DGPS"
+                "1" -> "GPS"
+                else -> "Fix=$quality"
+            }
 
             Log.i(logTag, "[$qualityLabel] lat=$lat lon=$lon alt=${altitude}m sats=$numSats hdop=$hdop")
 
@@ -591,15 +606,13 @@ class PositionService : Service() {
     private fun parseRmc(line: String) {
         val parts = (if (line.contains("*")) line.substringBefore("*") else line).split(",")
         if (parts.size < 9) return
-        if (parts[2] != "A") return // A = données valides, V = invalides
+        if (parts[2] != "A") return // A = données valides
 
         try {
             val speedKnots = parts[7].toDoubleOrNull() ?: return
             val heading = parts[8].toDoubleOrNull() ?: 0.0
-
-            currentSpeedMs = (speedKnots * 0.514444).toFloat() // nœuds → m/s
+            currentSpeedMs = (speedKnots * 0.514444).toFloat()
             currentHeading = heading.toFloat()
-
             Log.d(logTag, "RMC speed=${String.format("%.2f", currentSpeedMs)}m/s heading=${String.format("%.1f", currentHeading)}°")
         } catch (e: Exception) {
             Log.e(logTag, "Erreur parsing RMC: ${e.message}")
@@ -623,7 +636,7 @@ class PositionService : Service() {
             if (start < 1 || end < 0 || end <= start) return true
             val data = sentence.substring(start, end)
             val expected = sentence.substring(end + 1, minOf(end + 3, sentence.length)).toInt(16)
-            sentence.substring(start, end).fold(0) { acc, c -> acc xor c.code } == expected
+            data.fold(0) { acc, c -> acc xor c.code } == expected
         } catch (_: Exception) { true }
     }
 
@@ -633,7 +646,11 @@ class PositionService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, "Service GPS RTK", NotificationManager.IMPORTANCE_LOW)
+            val channel = NotificationChannel(
+                channelId,
+                "Service GPS RTK",
+                NotificationManager.IMPORTANCE_LOW
+            )
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
     }
