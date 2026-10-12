@@ -75,7 +75,8 @@ class LocationSocketClient(
                 reconnectionDelay = 2000
                 reconnectionDelayMax = 15000
                 timeout = 8000
-                transports = arrayOf("websocket") // evite le fallback long-polling coute plus cher en energie
+                // Suppression de "transports = arrayOf("websocket")" pour autoriser
+                // le handshake initial en polling, indispensable pour Socket.IO.
                 auth = mapOf(
                     "deviceId" to deviceId,
                     "key" to apiKey,
