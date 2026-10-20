@@ -9,7 +9,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.util.Log
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.Spinner
@@ -25,6 +24,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
+    private lateinit var viewLogsButton: Button
 
     private lateinit var deviceIdEditText: TextInputEditText
     private lateinit var portSpinner: Spinner
@@ -37,10 +37,10 @@ class MainActivity : AppCompatActivity() {
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
             if (permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true) {
-                Log.d(TAG, "Permission ACCESS_FINE_LOCATION accordée")
+                AppLogger.d(TAG, "Permission ACCESS_FINE_LOCATION accordée")
                 checkPermissionsAndStart()
             } else {
-                Log.e(TAG, "Permission ACCESS_FINE_LOCATION refusée")
+                AppLogger.e(TAG, "Permission ACCESS_FINE_LOCATION refusée")
                 statusText.text = "Permission de localisation refusée"
             }
         }
@@ -53,6 +53,7 @@ class MainActivity : AppCompatActivity() {
         statusText = findViewById(R.id.statusText)
         startButton = findViewById(R.id.startButton)
         stopButton = findViewById(R.id.stopButton)
+        viewLogsButton = findViewById(R.id.viewLogsButton)
 
         deviceIdEditText = findViewById(R.id.deviceIdEditText)
         portSpinner = findViewById(R.id.portSpinner)
@@ -65,9 +66,12 @@ class MainActivity : AppCompatActivity() {
 
         startButton.setOnClickListener { checkPermissionsAndStart() }
         stopButton.setOnClickListener { stopGPSService() }
+        viewLogsButton.setOnClickListener {
+            startActivity(Intent(this, LogsActivity::class.java))
+        }
         saveButton.setOnClickListener { savePreferences() }
 
-        Log.d(TAG, "MainActivity créée et UI initialisée")
+        AppLogger.d(TAG, "MainActivity créée et UI initialisée")
         updateStatus()
         GpsWatchdogWorker.schedule(this)
     }
@@ -154,7 +158,7 @@ class MainActivity : AppCompatActivity() {
         AppPreferences.setSendIntervalMs(this, selectedIntervalMs)
 
         Toast.makeText(this, "Paramètres enregistrés", Toast.LENGTH_SHORT).show()
-        Log.d(TAG, "Paramètres sauvegardés: ID=$newDeviceId, Port=$selectedPort, Baud=$selectedBaudRate, Interval=${selectedIntervalMs}ms")
+        AppLogger.d(TAG, "Paramètres sauvegardés: ID=$newDeviceId, Port=$selectedPort, Baud=$selectedBaudRate, Interval=${selectedIntervalMs}ms")
 
         if (isServiceRunning(PositionService::class.java)) {
             val reloadIntent = Intent(this, PositionService::class.java).apply {
@@ -171,7 +175,7 @@ class MainActivity : AppCompatActivity() {
         ) == PackageManager.PERMISSION_GRANTED
 
         if (!fineLocationGranted) {
-            Log.d(TAG, "Demande permission ACCESS_FINE_LOCATION")
+            AppLogger.d(TAG, "Demande permission ACCESS_FINE_LOCATION")
             requestPermissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
             return
         }
@@ -182,7 +186,7 @@ class MainActivity : AppCompatActivity() {
             ) == PackageManager.PERMISSION_GRANTED
 
             if (!backgroundLocationGranted) {
-                Log.w(TAG, "Permission ACCESS_BACKGROUND_LOCATION manquante")
+                AppLogger.w(TAG, "Permission ACCESS_BACKGROUND_LOCATION manquante")
                 AlertDialog.Builder(this)
                     .setTitle("Permission en arrière-plan nécessaire")
                     .setMessage("Veuillez autoriser le suivi permanent dans les paramètres.")
@@ -197,21 +201,21 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        Log.d(TAG, "Démarrage direct du service GPS Sender")
+        AppLogger.d(TAG, "Démarrage direct du service GPS Sender")
         startGPSService()
     }
 
     private fun startGPSService() {
         val intent = Intent(this, PositionService::class.java)
         ContextCompat.startForegroundService(this, intent)
-        Log.d(TAG, "Service PositionService démarré")
+        AppLogger.d(TAG, "Service PositionService démarré")
         updateStatus()
     }
 
     private fun stopGPSService() {
         val intent = Intent(this, PositionService::class.java)
         stopService(intent)
-        Log.d(TAG, "Service PositionService arrêté")
+        AppLogger.d(TAG, "Service PositionService arrêté")
         updateStatus()
         GpsWatchdogWorker.cancel(this)
     }
@@ -219,7 +223,7 @@ class MainActivity : AppCompatActivity() {
     private fun updateStatus() {
         val isRunning = isServiceRunning(PositionService::class.java)
         statusText.text = if (isRunning) "GPS Sender en cours" else "GPS Sender arrêté"
-        Log.d(TAG, "Status mis à jour: ${statusText.text}")
+        AppLogger.d(TAG, "Status mis à jour: ${statusText.text}")
     }
 
     private fun isServiceRunning(serviceClass: Class<*>): Boolean {
@@ -232,9 +236,9 @@ class MainActivity : AppCompatActivity() {
 }
 
 fun logDeviceInfo() {
-    Log.d("DEVICE_INFO", "Manufacturer: ${Build.MANUFACTURER}")
-    Log.d("DEVICE_INFO", "Model: ${Build.MODEL}")
-    Log.d("DEVICE_INFO", "Device: ${Build.DEVICE}")
-    Log.d("DEVICE_INFO", "Android SDK: ${Build.VERSION.SDK_INT}")
-    Log.d("DEVICE_INFO", "Android version: ${Build.VERSION.RELEASE}")
+    AppLogger.d("DEVICE_INFO", "Manufacturer: ${Build.MANUFACTURER}")
+    AppLogger.d("DEVICE_INFO", "Model: ${Build.MODEL}")
+    AppLogger.d("DEVICE_INFO", "Device: ${Build.DEVICE}")
+    AppLogger.d("DEVICE_INFO", "Android SDK: ${Build.VERSION.SDK_INT}")
+    AppLogger.d("DEVICE_INFO", "Android version: ${Build.VERSION.RELEASE}")
 }

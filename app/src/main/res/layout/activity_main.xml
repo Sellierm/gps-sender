@@ -54,7 +54,8 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="horizontal"
-                    android:gravity="center">
+                    android:gravity="center"
+                    android:layout_marginBottom="12dp">
 
                     <Button
                         android:id="@+id/startButton"
@@ -74,6 +75,15 @@
                         android:text="Arrêter"
                         android:backgroundTint="#C62828" />
                 </LinearLayout>
+
+                <Button
+                    android:id="@+id/viewLogsButton"
+                    style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Consulter les logs (NMEA &amp; App)"
+                    android:textColor="#80CBC4"
+                    app:strokeColor="#80CBC4" />
 
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>

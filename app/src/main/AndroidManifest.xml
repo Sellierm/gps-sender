@@ -39,6 +39,12 @@
             </intent-filter>
         </activity>
 
+        <!-- ✅ Activité de consultation des logs -->
+        <activity
+            android:name=".LogsActivity"
+            android:exported="false"
+            android:label="Logs GPS Sender" />
+
         <!-- ✅ Service de localisation en avant-plan -->
         <service
             android:name=".PositionService"
