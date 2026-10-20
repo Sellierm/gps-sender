@@ -10,17 +10,27 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.util.Log
+import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.Spinner
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import com.google.android.material.textfield.TextInputEditText
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var statusText: TextView
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
+
+    private lateinit var deviceIdEditText: TextInputEditText
+    private lateinit var portSpinner: Spinner
+    private lateinit var baudRateSpinner: Spinner
+    private lateinit var refreshRateSpinner: Spinner
+    private lateinit var saveButton: Button
 
     private val TAG = "GPS_SENDER_LOG"
 
@@ -44,12 +54,115 @@ class MainActivity : AppCompatActivity() {
         startButton = findViewById(R.id.startButton)
         stopButton = findViewById(R.id.stopButton)
 
+        deviceIdEditText = findViewById(R.id.deviceIdEditText)
+        portSpinner = findViewById(R.id.portSpinner)
+        baudRateSpinner = findViewById(R.id.baudRateSpinner)
+        refreshRateSpinner = findViewById(R.id.refreshRateSpinner)
+        saveButton = findViewById(R.id.saveButton)
+
+        setupSpinners()
+        loadPreferences()
+
         startButton.setOnClickListener { checkPermissionsAndStart() }
         stopButton.setOnClickListener { stopGPSService() }
+        saveButton.setOnClickListener { savePreferences() }
 
         Log.d(TAG, "MainActivity créée et UI initialisée")
         updateStatus()
         GpsWatchdogWorker.schedule(this)
+    }
+
+    private fun setupSpinners() {
+        val portLabels = AppPreferences.AVAILABLE_PORTS.map { it.first }
+        val portAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, portLabels)
+        portAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        portSpinner.adapter = portAdapter
+
+        val baudLabels = AppPreferences.AVAILABLE_BAUD_RATES.map { "$it baud" }
+        val baudAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, baudLabels)
+        baudAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        baudRateSpinner.adapter = baudAdapter
+
+        val refreshLabels = AppPreferences.AVAILABLE_INTERVALS.map { it.first }
+        val refreshAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, refreshLabels)
+        refreshAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        refreshRateSpinner.adapter = refreshAdapter
+    }
+
+    private fun loadPreferences() {
+        val currentDeviceId = AppPreferences.getDeviceId(this)
+        deviceIdEditText.setText(currentDeviceId)
+
+        val currentPort = AppPreferences.getSerialPort(this)
+        val portIndex = AppPreferences.AVAILABLE_PORTS.indexOfFirst { it.second == currentPort }
+        if (portIndex >= 0) {
+            portSpinner.setSelection(portIndex)
+        } else {
+            portSpinner.setSelection(0)
+        }
+
+        val currentBaud = AppPreferences.getBaudRate(this)
+        val baudIndex = AppPreferences.AVAILABLE_BAUD_RATES.indexOf(currentBaud)
+        if (baudIndex >= 0) {
+            baudRateSpinner.setSelection(baudIndex)
+        } else {
+            val defaultIndex = AppPreferences.AVAILABLE_BAUD_RATES.indexOf(AppPreferences.DEFAULT_BAUD_RATE)
+            baudRateSpinner.setSelection(if (defaultIndex >= 0) defaultIndex else 0)
+        }
+
+        val currentInterval = AppPreferences.getSendIntervalMs(this)
+        val intervalIndex = AppPreferences.AVAILABLE_INTERVALS.indexOfFirst { it.second == currentInterval }
+        if (intervalIndex >= 0) {
+            refreshRateSpinner.setSelection(intervalIndex)
+        } else {
+            val defaultIndex = AppPreferences.AVAILABLE_INTERVALS.indexOfFirst { it.second == AppPreferences.DEFAULT_SEND_INTERVAL_MS }
+            refreshRateSpinner.setSelection(if (defaultIndex >= 0) defaultIndex else 0)
+        }
+    }
+
+    private fun savePreferences() {
+        val newDeviceId = deviceIdEditText.text.toString().trim()
+        if (newDeviceId.isEmpty()) {
+            Toast.makeText(this, "Veuillez saisir un ID d'appareil valide", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val selectedPortIndex = portSpinner.selectedItemPosition
+        val selectedPort = if (selectedPortIndex in AppPreferences.AVAILABLE_PORTS.indices) {
+            AppPreferences.AVAILABLE_PORTS[selectedPortIndex].second
+        } else {
+            AppPreferences.DEFAULT_PORT_AUTO
+        }
+
+        val selectedBaudIndex = baudRateSpinner.selectedItemPosition
+        val selectedBaudRate = if (selectedBaudIndex in AppPreferences.AVAILABLE_BAUD_RATES.indices) {
+            AppPreferences.AVAILABLE_BAUD_RATES[selectedBaudIndex]
+        } else {
+            AppPreferences.DEFAULT_BAUD_RATE
+        }
+
+        val selectedIntervalIndex = refreshRateSpinner.selectedItemPosition
+        val selectedIntervalMs = if (selectedIntervalIndex in AppPreferences.AVAILABLE_INTERVALS.indices) {
+            AppPreferences.AVAILABLE_INTERVALS[selectedIntervalIndex].second
+        } else {
+            AppPreferences.DEFAULT_SEND_INTERVAL_MS
+        }
+
+        AppPreferences.setDeviceId(this, newDeviceId)
+        AppPreferences.setSerialPort(this, selectedPort)
+        AppPreferences.setBaudRate(this, selectedBaudRate)
+        AppPreferences.setSendIntervalMs(this, selectedIntervalMs)
+
+        Toast.makeText(this, "Paramètres enregistrés", Toast.LENGTH_SHORT).show()
+        Log.d(TAG, "Paramètres sauvegardés: ID=$newDeviceId, Port=$selectedPort, Baud=$selectedBaudRate, Interval=${selectedIntervalMs}ms")
+
+        if (isServiceRunning(PositionService::class.java)) {
+            val reloadIntent = Intent(this, PositionService::class.java).apply {
+                action = PositionService.ACTION_RELOAD_SETTINGS
+            }
+            startService(reloadIntent)
+            Toast.makeText(this, "Paramètres appliqués au service en cours", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun checkPermissionsAndStart() {
@@ -84,9 +197,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Démarrage direct sans vérifier le GPS interne
-        // La tablette CHCNAV utilise le port série /dev/ttyS4
-        Log.d(TAG, "Démarrage direct du service (port série RTK)")
+        Log.d(TAG, "Démarrage direct du service GPS Sender")
         startGPSService()
     }
 
