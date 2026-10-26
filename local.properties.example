@@ -1,11 +1,11 @@
 # Copy this file to local.properties and fill in your values.
 # local.properties is gitignored and must never be committed.
+#
+# Optional: these are only DEFAULT values baked into the build.
+# The server URL, API key and device ID can all be changed from the app's settings screen.
 
-# API key for authenticating requests to the location endpoint
+# API key for authenticating with the Socket.IO server
 API_KEY=your_api_key_here
 
-# Full URL of the location API endpoint
-API_URL=https://your-server.example.com/api/location
-
-# Device identifier sent with every location update
-DEVICE_ID=your_device_id_here
+# Socket.IO server URL
+API_URL=https://your-server.example.com

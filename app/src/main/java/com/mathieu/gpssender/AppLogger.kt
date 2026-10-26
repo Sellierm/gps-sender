@@ -1,15 +1,16 @@
 package com.mathieu.gpssender
 
 import android.util.Log
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
 
 object AppLogger {
     private const val MAX_LOGS = 1000
-    private val timeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault())
-    private val logQueue = ConcurrentLinkedQueue<String>()
+
+    // DateTimeFormatter est thread-safe (contrairement à SimpleDateFormat)
+    private val timeFormat = DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
+    private val logBuffer = ArrayDeque<String>(MAX_LOGS)
+    private val lock = Any()
 
     interface LogListener {
         fun onLogAdded(logLine: String)
@@ -49,27 +50,23 @@ object AppLogger {
     }
 
     private fun append(level: String, tag: String, msg: String) {
-        val timestamp = timeFormat.format(Date())
+        val timestamp = LocalTime.now().format(timeFormat)
         val logLine = "[$timestamp][$level][$tag] $msg"
 
-        logQueue.add(logLine)
-        while (logQueue.size > MAX_LOGS) {
-            logQueue.poll()
+        synchronized(lock) {
+            if (logBuffer.size >= MAX_LOGS) logBuffer.removeFirst()
+            logBuffer.addLast(logLine)
         }
 
         listener?.onLogAdded(logLine)
     }
 
-    fun getAllLogs(): List<String> {
-        return logQueue.toList()
-    }
+    fun getAllLogs(): List<String> = synchronized(lock) { logBuffer.toList() }
 
-    fun getFormattedLogs(): String {
-        return logQueue.joinToString("\n")
-    }
+    fun getFormattedLogs(): String = synchronized(lock) { logBuffer.joinToString("\n") }
 
     fun clear() {
-        logQueue.clear()
+        synchronized(lock) { logBuffer.clear() }
         listener?.onLogsCleared()
     }
 }

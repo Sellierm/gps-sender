@@ -13,6 +13,10 @@ import com.google.android.material.materialswitch.MaterialSwitch
 
 class LogsActivity : AppCompatActivity(), AppLogger.LogListener {
 
+    companion object {
+        private const val MAX_DISPLAYED_LINES = 1500
+    }
+
     private lateinit var backButton: ImageButton
     private lateinit var copyButton: Button
     private lateinit var clearButton: Button
@@ -46,8 +50,6 @@ class LogsActivity : AppCompatActivity(), AppLogger.LogListener {
         clearButton.setOnClickListener {
             AppLogger.clear()
         }
-
-        loadInitialLogs()
     }
 
     override fun onResume() {
@@ -62,15 +64,20 @@ class LogsActivity : AppCompatActivity(), AppLogger.LogListener {
     }
 
     private fun loadInitialLogs() {
-        logsTextView.text = AppPreferences.getDeviceId(this).let {
-            AppLogger.getFormattedLogs()
-        }
+        logsTextView.text = AppLogger.getFormattedLogs()
         scrollToBottom()
     }
 
     override fun onLogAdded(logLine: String) {
         runOnUiThread {
-            logsTextView.append("$logLine\n")
+            // Le buffer d'AppLogger est borné : on resynchronise pour que le TextView ne grossisse pas indéfiniment
+            if (logsTextView.lineCount > MAX_DISPLAYED_LINES) {
+                logsTextView.text = AppLogger.getFormattedLogs()
+            } else if (logsTextView.text.isEmpty()) {
+                logsTextView.text = logLine
+            } else {
+                logsTextView.append("\n$logLine")
+            }
             if (autoScrollSwitch.isChecked) {
                 scrollToBottom()
             }

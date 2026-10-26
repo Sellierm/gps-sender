@@ -24,7 +24,6 @@ android {
 
         buildConfigField("String", "API_KEY", "\"${localProperties.getProperty("API_KEY") ?: ""}\"")
         buildConfigField("String", "API_URL", "\"${localProperties.getProperty("API_URL") ?: ""}\"")
-        buildConfigField("String", "DEVICE_ID", "\"${localProperties.getProperty("DEVICE_ID") ?: ""}\"")
     }
 
     buildFeatures {
@@ -54,10 +53,10 @@ dependencies {
     implementation(libs.androidx.activity)
     implementation(libs.androidx.constraintlayout)
     implementation(libs.socket.io.client)
+    // Force une version récente d'OkHttp (socket.io-client embarque OkHttp 3.x par défaut)
+    implementation(libs.okhttp)
+    implementation(libs.androidx.work.runtime.ktx)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
-    implementation("com.google.android.gms:play-services-location:21.0.1")
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("androidx.work:work-runtime-ktx:2.9.0")
 }

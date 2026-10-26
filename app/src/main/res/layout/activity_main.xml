@@ -130,6 +130,46 @@
                         android:textSize="16sp" />
                 </com.google.android.material.textfield.TextInputLayout>
 
+                <!-- Champ URL serveur -->
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="16dp"
+                    android:hint="URL du serveur (API URL)"
+                    app:boxBackgroundMode="outline"
+                    app:boxStrokeColor="#80CBC4"
+                    app:hintTextColor="#80CBC4">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/apiUrlEditText"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="textUri"
+                        android:textColor="@android:color/white"
+                        android:textSize="16sp" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <!-- Champ clé API (masquée, affichable via l'icône œil) -->
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="16dp"
+                    android:hint="Clé API (API Key)"
+                    app:boxBackgroundMode="outline"
+                    app:boxStrokeColor="#80CBC4"
+                    app:hintTextColor="#80CBC4"
+                    app:endIconMode="password_toggle"
+                    app:endIconTint="#B0BEC5">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/apiKeyEditText"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="textPassword"
+                        android:textColor="@android:color/white"
+                        android:textSize="16sp" />
+                </com.google.android.material.textfield.TextInputLayout>
+
                 <!-- Champ Port Série -->
                 <TextView
                     android:layout_width="match_parent"

@@ -21,6 +21,7 @@ L'application est spécialement optimisée pour les tablettes professionnelles (
   - **WakeLock** pour empêcher la mise en veille par le système d'exploitation.
   - **Démarrage au boot** (`BootReceiver`).
   - **Watchdog (WorkManager)** relançant automatiquement le service en cas de fermeture inattendue par le système.
+  - Un arrêt volontaire via le bouton **Arrêter** est mémorisé : ni le watchdog ni le redémarrage au boot ne relancent alors le service.
 - **Interface de configuration dynamique** :
   - Modification de tous les paramètres en direct sans fermeture de l'application ni arrêt du suivi.
 
@@ -28,14 +29,13 @@ L'application est spécialement optimisée pour les tablettes professionnelles (
 
 ## ⚙️ Configuration de l'application
 
-### 1. Variables de compilation (`local.properties`)
+### 1. Valeurs par défaut à la compilation (`local.properties`, optionnel)
 
-Créez un fichier `local.properties` à la racine du projet (vous pouvez vous appuyer sur `local.properties.example`) :
+L'URL du serveur et la clé API se règlent directement dans l'application. Vous pouvez néanmoins fournir des valeurs par défaut, utilisées tant que rien n'a été saisi dans l'appli (pratique pour préconfigurer une flotte de tablettes). Créez pour cela un fichier `local.properties` à la racine du projet (voir `local.properties.example`) :
 
 ```properties
 API_KEY=votre_cle_api_securisee
 API_URL=https://votre-serveur.example.com
-DEVICE_ID=votre_id_appareil
 ```
 
 Ces valeurs sont injectées à la compilation via `BuildConfig`.
@@ -46,9 +46,11 @@ Vous pouvez modifier à tout moment la configuration directement dans l'interfac
 
 | Paramètre | Description | Options disponibles | Valeur par défaut |
 | :--- | :--- | :--- | :--- |
-| **ID Appareil** | Identifiant unique de la tablette/véhicule envoyé au serveur | Saisie texte libre | Valeur `DEVICE_ID` de `local.properties` ou `CHCNAV_TABLET` |
+| **ID Appareil** | Identifiant unique de la tablette/véhicule envoyé au serveur | Saisie texte libre | `CHCNAV_TABLET` |
+| **URL du serveur** | Adresse du serveur Socket.IO | Saisie libre (`http://` ou `https://`) | `API_URL` de `local.properties` |
+| **Clé API** | Clé d'authentification envoyée lors du handshake (champ masqué) | Saisie libre | `API_KEY` de `local.properties` |
 | **Port Série** | Port périphérique raccordé au module RTK | `Auto-détection`, `/dev/ttyS4`, `/dev/ttyS3`, `/dev/ttyS2`, `/dev/ttyS1`, `/dev/ttyS0`, `/dev/tty3`, `/dev/tty4`, `/dev/ttyUSB0`, `/dev/ttyUSB1` | `Auto-détection` |
-| **Baud Rate** | Vitesse de communication série | `9600`, `19200`, `38400`, `57600`, `115200`, `230400`, `460800`, `921600` baud | `115200` baud |
+| **Baud Rate** | Vitesse de communication série. En `Auto-détection`, chaque vitesse est essayée jusqu'à recevoir des trames NMEA valides (nouvelle détection automatique si le flux devient illisible) | `Auto-détection`, `9600`, `19200`, `38400`, `57600`, `115200`, `230400`, `460800`, `921600` baud | `115200` baud |
 | **Taux de rafraîchissement** | Intervalle d'envoi des positions au serveur | `100 ms (10 Hz)`, `200 ms (5 Hz)`, `500 ms (2 Hz)`, `1000 ms (1 Hz)`, `2000 ms`, `5000 ms`, `10000 ms` | `1000 ms (1 Hz)` |
 
 > 💡 **Remarque :** Lorsque le service est actif, cliquer sur **"Enregistrer les paramètres"** retransmet instantanément la nouvelle configuration au service en cours d'exécution sans interrompre le suivi ni fermer l'application.
@@ -84,10 +86,12 @@ Chaque position est envoyée sur l'événement Socket.IO `"location"` sous forme
 
 ```text
 com.mathieu.gpssender
+├── AppLogger.kt            # Logs en mémoire (1000 lignes) consultables depuis l'application
 ├── AppPreferences.kt       # Persistance des configurations utilisateur (SharedPreferences)
 ├── BootReceiver.kt         # Démarrage automatique du service au boot de l'appareil
-├── GPSWatchdogWorker.kt    # Tâche WorkManager pour surveiller et maintenir le service actif
+├── GpsWatchdogWorker.kt    # Tâche WorkManager pour surveiller et maintenir le service actif
 ├── LocationSocketClient.kt # Client WebSocket persistant Socket.IO (connect, emit location, ack)
+├── LogsActivity.kt         # Écran de consultation des logs en direct (NMEA & application)
 ├── MainActivity.kt         # Interface utilisateur (champs de réglages, statuts et boutons)
 └── PositionService.kt      # Service premier plan (lecture port série, parsing NMEA, lissage, envoi)
 ```

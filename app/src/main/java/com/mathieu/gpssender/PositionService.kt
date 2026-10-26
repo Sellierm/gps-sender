@@ -10,14 +10,18 @@ import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import androidx.core.location.LocationManagerCompat
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.io.InputStream
+import java.util.Locale
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import kotlin.math.*
@@ -26,17 +30,48 @@ class PositionService : Service() {
 
     companion object {
         const val ACTION_RELOAD_SETTINGS = "com.mathieu.gpssender.RELOAD_SETTINGS"
+
+        /** Vrai tant que le service tourne dans ce process (remplace ActivityManager.getRunningServices, déprécié). */
+        @Volatile
+        var isActive = false
+            private set
+
+        /**
+         * Démarre le service en avant-plan. Depuis Android 12, le démarrage depuis l'arrière-plan
+         * (watchdog, boot) peut être refusé par le système : on log au lieu de crasher.
+         */
+        fun start(context: Context) {
+            try {
+                ContextCompat.startForegroundService(context, Intent(context, PositionService::class.java))
+            } catch (e: Exception) {
+                AppLogger.e("GPS_SENDER_LOG", "Démarrage du service refusé par le système", e)
+            }
+        }
+
+        private const val NOTIFICATION_MIN_INTERVAL_MS = 1000L
+
+        // Auto-détection du baud rate : durée d'écoute par vitesse et nombre de trames NMEA valides exigées
+        // (à une mauvaise vitesse on ne lit que du bruit, dont le checksum ne tombe juste que par hasard)
+        private const val BAUD_PROBE_DURATION_MS = 2_000L
+        private const val BAUD_PROBE_MIN_VALID_SENTENCES = 2
+        // En mode auto, sans trame valide pendant ce délai, on relance la détection (récepteur reconfiguré...)
+        private const val AUTO_BAUD_STALE_MS = 15_000L
+        private val NMEA_SENTENCE_REGEX = Regex("""\$[A-Z]{5},[^$*\r\n]*\*[0-9A-Fa-f]{2}""")
+        private const val LOCATION_DISABLED_TEXT = "⚠️ Localisation désactivée sur l'appareil — aucune position"
     }
 
     private val logTag = "GPS_SENDER_LOG"
     private lateinit var locationManager: LocationManager
     private lateinit var locationListener: LocationListener
+    // Dernier fix du fournisseur GPS : tant qu'il est récent, les positions réseau (±centaines de m) sont ignorées
+    @Volatile private var lastInternalGpsFix = 0L
+    private val GPS_PREFERRED_WINDOW_MS = 5_000L
 
     // ─────────────────────────────────────────────
     // Envoi des positions — Socket.IO persistant
     // ─────────────────────────────────────────────
 
-    private lateinit var socketClient: LocationSocketClient
+    @Volatile private var socketClient: LocationSocketClient? = null
     @Volatile private var socketConnected = false
 
     private val notificationId = 1
@@ -54,6 +89,8 @@ class PositionService : Service() {
     @Volatile private var lastRtkTimestamp = 0L
     @Volatile private var rtkActiveStartTimestamp = 0L
     @Volatile private var internalGpsActive = false
+    @Volatile private var sendIntervalMs = AppPreferences.DEFAULT_SEND_INTERVAL_MS
+    @Volatile private var lastNotificationUpdate = 0L
 
     private val RTK_PRIORITY_TIMEOUT_MS = 10_000L
     private val RTK_GPS_CUTOFF_MS = 30_000L
@@ -97,18 +134,6 @@ class PositionService : Service() {
     @Volatile private var currentSpeedMs = 0f
     @Volatile private var currentHeading = 0f
 
-    private val SERIAL_PATHS = listOf(
-        "/dev/ttyS4",
-        "/dev/ttyS3",
-        "/dev/ttyS2",
-        "/dev/ttyS1",
-        "/dev/ttyS0",
-        "/dev/tty3",
-        "/dev/tty4",
-        "/dev/ttyUSB0",
-        "/dev/ttyUSB1"
-    )
-
     // ─────────────────────────────────────────────
     // Cycle de vie
     // ─────────────────────────────────────────────
@@ -117,30 +142,59 @@ class PositionService : Service() {
         super.onCreate()
         AppLogger.d(logTag, "PositionService onCreate()")
         createNotificationChannel()
+        sendIntervalMs = AppPreferences.getSendIntervalMs(this)
 
         locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
-        locationListener = LocationListener { location ->
-            val now = System.currentTimeMillis()
-            val rtkIsActive = (now - lastRtkTimestamp) < RTK_PRIORITY_TIMEOUT_MS
-            if (!rtkIsActive) {
-                AppLogger.d(logTag, "GPS interne utilisé (RTK inactif)")
-                processLocation(
-                    PendingLocation(
-                        latitude = location.latitude,
-                        longitude = location.longitude,
-                        altitude = location.altitude,
-                        accuracy = location.accuracy,
-                        timestamp = now,
-                        source = "GPS Interne",
-                        speed = if (location.hasSpeed()) location.speed else 0f,
-                        heading = if (location.hasBearing()) location.bearing else 0f
-                    )
-                )
-            } else {
-                AppLogger.d(logTag, "GPS interne ignoré (RTK actif)")
+        // Objet complet (et non lambda) : avant Android 11, onProviderEnabled/Disabled/onStatusChanged
+        // n'ont pas d'implémentation par défaut et provoqueraient un AbstractMethodError.
+        locationListener = object : LocationListener {
+            override fun onLocationChanged(location: Location) = onInternalLocation(location)
+
+            override fun onProviderEnabled(provider: String) {
+                AppLogger.i(logTag, "Fournisseur de localisation activé : $provider")
+                updateNotification("Localisation activée ($provider) — recherche de position…", force = true)
             }
+
+            override fun onProviderDisabled(provider: String) {
+                AppLogger.w(logTag, "Fournisseur de localisation désactivé : $provider")
+                if (!isLocationEnabled()) {
+                    updateNotification(LOCATION_DISABLED_TEXT, force = true)
+                }
+            }
+
+            @Deprecated("Requis avant Android 11")
+            override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
         }
     }
+
+    private fun onInternalLocation(location: Location) {
+        val now = System.currentTimeMillis()
+        if (location.provider == LocationManager.GPS_PROVIDER) {
+            lastInternalGpsFix = now
+        } else if (now - lastInternalGpsFix < GPS_PREFERRED_WINDOW_MS) {
+            return
+        }
+        val rtkIsActive = (now - lastRtkTimestamp) < RTK_PRIORITY_TIMEOUT_MS
+        if (!rtkIsActive) {
+            AppLogger.d(logTag, "GPS interne utilisé (RTK inactif)")
+            processLocation(
+                PendingLocation(
+                    latitude = location.latitude,
+                    longitude = location.longitude,
+                    altitude = location.altitude,
+                    accuracy = location.accuracy,
+                    timestamp = now,
+                    source = "GPS Interne",
+                    speed = if (location.hasSpeed()) location.speed else 0f,
+                    heading = if (location.hasBearing()) location.bearing else 0f
+                )
+            )
+        } else {
+            AppLogger.d(logTag, "GPS interne ignoré (RTK actif)")
+        }
+    }
+
+    private fun isLocationEnabled(): Boolean = LocationManagerCompat.isLocationEnabled(locationManager)
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         AppLogger.d(logTag, "PositionService onStartCommand() action=${intent?.action}")
@@ -157,16 +211,24 @@ class PositionService : Service() {
             AppLogger.d(logTag, "onStartCommand ignoré : service déjà actif")
             return START_STICKY
         }
-        isRunning = true
-
-        acquireWakeLock()
 
         val notification = createNotification("Démarrage…")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(notificationId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
-        } else {
-            startForeground(notificationId, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(notificationId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+            } else {
+                startForeground(notificationId, notification)
+            }
+        } catch (e: Exception) {
+            // Ex : ForegroundServiceStartNotAllowedException / SecurityException (permission retirée)
+            AppLogger.e(logTag, "Impossible de passer en avant-plan, arrêt du service", e)
+            stopSelf()
+            return START_NOT_STICKY
         }
+
+        isRunning = true
+        isActive = true
+        acquireWakeLock()
 
         connectSocket()
         startAutoDetectAndRead()
@@ -181,13 +243,14 @@ class PositionService : Service() {
         val newBaudRate = AppPreferences.getBaudRate(this)
         val newPort = AppPreferences.getSerialPort(this)
         val newInterval = AppPreferences.getSendIntervalMs(this)
+        sendIntervalMs = newInterval
 
-        AppLogger.i(logTag, "Paramètres rechargés: ID=$newDeviceId, Port=$newPort, Baud=$newBaudRate, Interval=${newInterval}ms")
+        AppLogger.i(logTag, "Paramètres rechargés: ID=$newDeviceId, Port=$newPort, Baud=${AppPreferences.baudRateLabel(newBaudRate)}, Interval=${newInterval}ms")
 
         try {
-            if (::socketClient.isInitialized) {
-                socketClient.disconnect()
-            }
+            socketClient?.disconnect()
+            socketClient = null
+            socketConnected = false
         } catch (e: Exception) {
             AppLogger.w(logTag, "Erreur déconnexion socket lors du rechargement: ${e.message}")
         }
@@ -204,11 +267,12 @@ class PositionService : Service() {
             startInternalGps()
         }
 
-        updateNotification("Paramètres mis à jour (ID: $newDeviceId)")
+        updateNotification("Paramètres mis à jour (ID: $newDeviceId)", force = true)
     }
 
     override fun onDestroy() {
         isRunning = false
+        isActive = false
         reconnectThread?.interrupt()
         readThread?.interrupt()
         senderThread?.interrupt()
@@ -226,7 +290,7 @@ class PositionService : Service() {
 
         try { serialFileStream?.close() } catch (e: Exception) { AppLogger.e(logTag, "Erreur fermeture port série", e) }
         try { locationManager.removeUpdates(locationListener) } catch (_: Exception) {}
-        try { if (::socketClient.isInitialized) socketClient.disconnect() } catch (_: Exception) {}
+        try { socketClient?.disconnect() } catch (_: Exception) {}
         releaseWakeLock()
         super.onDestroy()
         AppLogger.d(logTag, "PositionService arrêté")
@@ -269,26 +333,30 @@ class PositionService : Service() {
 
     private fun connectSocket() {
         val currentDeviceId = AppPreferences.getDeviceId(this)
-        if (BuildConfig.API_URL.isBlank() || BuildConfig.API_KEY.isBlank() || currentDeviceId.isBlank()) {
-            AppLogger.w(logTag, "Socket non configuré — envoi désactivé (BuildConfig incomplet ou ID vide)")
+        val apiUrl = AppPreferences.getApiUrl(this)
+        val apiKey = AppPreferences.getApiKey(this)
+        if (apiUrl.isBlank() || apiKey.isBlank() || currentDeviceId.isBlank()) {
+            AppLogger.w(logTag, "Socket non configuré — envoi désactivé (URL, clé API ou ID vide)")
+            updateNotification("⚠️ Serveur non configuré (URL / clé API)", force = true)
             return
         }
 
-        AppLogger.d(logTag, "Initialisation socket avec deviceId=$currentDeviceId")
-        socketClient = LocationSocketClient(
+        AppLogger.d(logTag, "Initialisation socket vers $apiUrl avec deviceId=$currentDeviceId")
+        val client = LocationSocketClient(
             deviceId = currentDeviceId,
-            apiKey = BuildConfig.API_KEY,
+            apiKey = apiKey,
         )
+        socketClient = client
 
-        socketClient.connect(BuildConfig.API_URL, object : LocationSocketClient.StatusListener {
+        client.connect(apiUrl, object : LocationSocketClient.StatusListener {
             override fun onConnected() {
                 socketConnected = true
-                updateNotification("Serveur connecté (ID: $currentDeviceId)")
+                updateNotification("Serveur connecté (ID: $currentDeviceId)", force = true)
             }
 
             override fun onDisconnected(reason: String?) {
                 socketConnected = false
-                updateNotification("Serveur déconnecté — reconnexion...")
+                updateNotification("Serveur déconnecté — reconnexion...", force = true)
             }
 
             override fun onConnectError(message: String?) {
@@ -301,36 +369,32 @@ class PositionService : Service() {
     // Gestion GPS interne (fallback si pas de RTK)
     // ─────────────────────────────────────────────
 
-    private fun startInternalGps() {
+    private val internalGpsLock = Any()
+
+    // Appelé depuis le main thread (démarrage) et le ReconnectThread (secours) : sérialisé pour éviter un double abonnement
+    private fun startInternalGps(): Unit = synchronized(internalGpsLock) {
+        if (internalGpsActive) return
         try {
             if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
                 checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
             ) {
-                val minTime = minOf(1000L, AppPreferences.getSendIntervalMs(this))
-                var requestedAny = false
+                val minTime = minOf(1000L, sendIntervalMs)
 
-                if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-                    locationManager.requestLocationUpdates(
-                        LocationManager.GPS_PROVIDER, minTime, 0f, locationListener, Looper.getMainLooper()
-                    )
-                    requestedAny = true
-                }
-                if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
-                    locationManager.requestLocationUpdates(
-                        LocationManager.NETWORK_PROVIDER, minTime, 0f, locationListener, Looper.getMainLooper()
-                    )
-                    requestedAny = true
-                }
-                if (!requestedAny) {
-                    try {
-                        locationManager.requestLocationUpdates(
-                            LocationManager.PASSIVE_PROVIDER, minTime, 0f, locationListener, Looper.getMainLooper()
-                        )
-                    } catch (_: Exception) {}
+                // On s'abonne même aux fournisseurs désactivés : les positions arriveront dès que
+                // l'utilisateur réactivera la localisation, sans redémarrer le service.
+                val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+                    .filter { it in locationManager.allProviders }
+                for (provider in providers) {
+                    locationManager.requestLocationUpdates(provider, minTime, 0f, locationListener, Looper.getMainLooper())
                 }
 
                 internalGpsActive = true
-                AppLogger.d(logTag, "GPS interne (fallback) activé (cadence: ${minTime}ms)")
+                AppLogger.d(logTag, "GPS interne (fallback) activé sur $providers (cadence: ${minTime}ms)")
+
+                if (!isLocationEnabled()) {
+                    AppLogger.w(logTag, "Localisation désactivée dans les paramètres de l'appareil — aucune position interne tant qu'elle n'est pas réactivée")
+                    updateNotification(LOCATION_DISABLED_TEXT, force = true)
+                }
 
                 val lastKnown = getBestLastKnownLocation()
                 if (lastKnown != null) {
@@ -365,7 +429,7 @@ class PositionService : Service() {
         return bestLocation
     }
 
-    private fun stopInternalGps(reason: String = "RTK actif") {
+    private fun stopInternalGps(reason: String = "RTK actif"): Unit = synchronized(internalGpsLock) {
         try {
             locationManager.removeUpdates(locationListener)
             internalGpsActive = false
@@ -377,8 +441,8 @@ class PositionService : Service() {
 
     private fun restoreInternalGps() {
         if (!internalGpsActive) {
+            AppLogger.i(logTag, "Restauration du GPS interne en secours (RTK non disponible)")
             startInternalGps()
-            AppLogger.i(logTag, "GPS interne restauré en secours (RTK non disponible)")
         }
     }
 
@@ -408,15 +472,21 @@ class PositionService : Service() {
     // Traitement des positions (filtrage + lissage + cadencement)
     // ─────────────────────────────────────────────
 
+    // Appelé depuis le main looper (GPS interne) et le thread série (RTK) : sérialisé pour le throttle
+    @Synchronized
     private fun processLocation(raw: PendingLocation) {
         val last = lastValidLocation
         if (last != null) {
-            val distanceM = haversineDistance(last.latitude, last.longitude, raw.latitude, raw.longitude)
+            // On retranche l'incertitude des deux positions : un saut d'une position réseau (±400 m)
+            // vers un fix GPS précis n'est pas un déplacement réel et ne doit pas bloquer les fix suivants
+            val uncertaintyM = last.accuracy + raw.accuracy
+            val distanceM = (haversineDistance(last.latitude, last.longitude, raw.latitude, raw.longitude) - uncertaintyM)
+                .coerceAtLeast(0.0)
             val deltaMs = raw.timestamp - last.timestamp
             if (deltaMs > 0) {
                 val speedKmh = (distanceM / deltaMs) * 3600.0
                 if (speedKmh > MAX_SPEED_KMH) {
-                    AppLogger.w(logTag, "Position aberrante ignorée: ${String.format("%.1f", speedKmh)} km/h")
+                    AppLogger.w(logTag, "Position aberrante ignorée: ${"%.1f".fmt(speedKmh)} km/h")
                     return
                 }
             }
@@ -428,13 +498,13 @@ class PositionService : Service() {
             raw
         }
 
-        val minInterval = AppPreferences.getSendIntervalMs(this)
+        val minInterval = sendIntervalMs
         val now = System.currentTimeMillis()
-        if (now - lastSentTimestampValue() < minInterval) {
+        if (now - lastSentTimestamp < minInterval) {
             AppLogger.d(logTag, "Throttle: ignoré (${raw.source}) [< ${minInterval}ms]")
             return
         }
-        setLastSentTimestamp(now)
+        lastSentTimestamp = now
         lastValidLocation = smoothed
 
         val queued = sendQueue.offer(smoothed)
@@ -443,15 +513,16 @@ class PositionService : Service() {
         } else {
             val queueInfo = if (sendQueue.size > 1) " | file: ${sendQueue.size}" else ""
             updateNotification(
-                "${if (socketConnected) "🟢" else "🔴"} ${smoothed.source} | ${String.format("%.7f", smoothed.latitude)}, " +
-                        "${String.format("%.7f", smoothed.longitude)}$queueInfo"
+                "${if (socketConnected) "🟢" else "🔴"} ${smoothed.source} | ${"%.7f".fmt(smoothed.latitude)}, " +
+                        "${"%.7f".fmt(smoothed.longitude)}$queueInfo"
             )
         }
     }
 
     @Volatile private var lastSentTimestamp = 0L
-    private fun lastSentTimestampValue() = lastSentTimestamp
-    private fun setLastSentTimestamp(v: Long) { lastSentTimestamp = v }
+
+    /** Formatage indépendant de la locale (évite "48,1234567" en français). */
+    private fun String.fmt(vararg args: Any): String = String.format(Locale.US, this, *args)
 
     private fun smoothPosition(pos: PendingLocation): PendingLocation? {
         synchronized(positionBufferLock) {
@@ -488,22 +559,24 @@ class PositionService : Service() {
         senderThread = Thread {
             AppLogger.d(logTag, "Thread d'envoi démarré")
             var consecutiveFailures = 0
+            // Position en échec gardée hors file pour être renvoyée en premier (ordre chronologique préservé)
+            var inFlight: PendingLocation? = null
 
             while (isRunning) {
                 try {
-                    val pending = sendQueue.poll(1, TimeUnit.SECONDS) ?: continue
+                    val pending = inFlight ?: sendQueue.poll(1, TimeUnit.SECONDS) ?: continue
 
                     val success = trySendLocation(pending)
 
                     if (success) {
+                        inFlight = null
                         consecutiveFailures = 0
                         if (sendQueue.size > 0) {
                             AppLogger.d(logTag, "File d'attente: ${sendQueue.size} positions restantes")
                         }
                     } else {
+                        inFlight = pending
                         consecutiveFailures++
-                        val requeued = sendQueue.offer(pending)
-                        if (!requeued) AppLogger.w(logTag, "File pleine, position perdue")
                         val delay = minOf(2000L * (1 shl minOf(consecutiveFailures - 1, 3)), 30_000L)
                         AppLogger.w(logTag, "Echec envoi ($consecutiveFailures), retry dans ${delay}ms | file: ${sendQueue.size}")
                         Thread.sleep(delay)
@@ -524,13 +597,15 @@ class PositionService : Service() {
     }
 
     private fun trySendLocation(pending: PendingLocation): Boolean {
-        val currentDeviceId = AppPreferences.getDeviceId(this)
-        if (BuildConfig.API_URL.isBlank() || BuildConfig.API_KEY.isBlank() || currentDeviceId.isBlank()) {
+        if (AppPreferences.getApiUrl(this).isBlank() || AppPreferences.getApiKey(this).isBlank() ||
+            AppPreferences.getDeviceId(this).isBlank()
+        ) {
             AppLogger.w(logTag, "Socket non configuré — envoi ignoré")
             return true
         }
 
-        if (!::socketClient.isInitialized || !socketClient.isConnected()) {
+        val client = socketClient
+        if (client == null || !client.isConnected()) {
             AppLogger.d(logTag, "Socket non connecté — envoi reporté")
             return false
         }
@@ -547,9 +622,9 @@ class PositionService : Service() {
                 put("source", pending.source)
             }
 
-            val success = socketClient.sendLocation(json)
+            val success = client.sendLocation(json)
             if (success) {
-                AppLogger.i(logTag, "Envoyé (${pending.source}) via socket | speed=${String.format("%.2f", pending.speed)}m/s heading=${String.format("%.1f", pending.heading)}°")
+                AppLogger.i(logTag, "Envoyé (${pending.source}) via socket | speed=${"%.2f".fmt(pending.speed)}m/s heading=${"%.1f".fmt(pending.heading)}°")
             } else {
                 AppLogger.w(logTag, "Échec ack socket")
             }
@@ -585,7 +660,10 @@ class PositionService : Service() {
                             if (!internalGpsActive) {
                                 restoreInternalGps()
                             }
-                            updateNotification("RTK: aucun port détecté — GPS interne actif")
+                            updateNotification(
+                                if (isLocationEnabled()) "RTK: aucun port détecté — GPS interne actif" else LOCATION_DISABLED_TEXT,
+                                force = true
+                            )
                             Thread.sleep(5000)
                         }
                     } else {
@@ -604,9 +682,13 @@ class PositionService : Service() {
         }
     }
 
+    // Dernier baud rate auto-détecté : essayé en premier lors des reconnexions
+    @Volatile private var detectedBaudRate: Int? = null
+
     private fun tryOpenSerialPort(): Boolean {
         val selectedPort = AppPreferences.getSerialPort(this)
-        val baudRate = AppPreferences.getBaudRate(this)
+        val configuredBaudRate = AppPreferences.getBaudRate(this)
+        val autoBaud = configuredBaudRate == AppPreferences.BAUD_RATE_AUTO
 
         val portsToTry = mutableListOf<String>()
 
@@ -614,7 +696,7 @@ class PositionService : Service() {
             portsToTry.add(selectedPort)
         }
 
-        for (path in SERIAL_PATHS) {
+        for (path in AppPreferences.SERIAL_PATHS) {
             if (!portsToTry.contains(path)) {
                 portsToTry.add(path)
             }
@@ -625,12 +707,17 @@ class PositionService : Service() {
             if (!device.exists()) { AppLogger.d(logTag, "$path n'existe pas, on passe"); continue }
             if (!device.canRead()) { AppLogger.w(logTag, "$path non lisible"); continue }
             try {
-                configureSerialPort(path, baudRate)
+                val baudRate = if (autoBaud) {
+                    detectBaudRate(path) ?: continue
+                } else {
+                    configureSerialPort(path, configuredBaudRate)
+                    configuredBaudRate
+                }
                 val fis = FileInputStream(device)
                 serialFileStream = fis
                 inputStream = fis
-                AppLogger.i(logTag, "Port série ouvert : $path @ $baudRate baud")
-                startSerialReadThread(path)
+                AppLogger.i(logTag, "Port série ouvert : $path @ $baudRate baud${if (autoBaud) " (auto-détecté)" else ""}")
+                startSerialReadThread(path, autoBaud)
                 return true
             } catch (e: Exception) {
                 AppLogger.w(logTag, "Echec $path : ${e.message}")
@@ -639,14 +726,62 @@ class PositionService : Service() {
         return false
     }
 
-    private fun configureSerialPort(path: String, baudRate: Int) {
+    /**
+     * Essaie chaque baud rate jusqu'à lire des trames NMEA au checksum valide.
+     * Retourne la vitesse trouvée, ou null si aucune ne convient.
+     */
+    private fun detectBaudRate(path: String): Int? {
+        val candidates = (listOfNotNull(detectedBaudRate) + AppPreferences.AUTO_DETECT_BAUD_ORDER).distinct()
+        AppLogger.i(logTag, "Auto-détection du baud rate sur $path...")
+        updateNotification("RTK : détection de la vitesse sur $path…", force = true)
+
+        for (baud in candidates) {
+            if (!isRunning) return null
+            // Si stty échoue, la vitesse n'est pas appliquée et la lecture pourrait bloquer : on ne sonde pas
+            if (!configureSerialPort(path, baud)) continue
+            if (probeNmea(path)) {
+                AppLogger.i(logTag, "Baud rate détecté sur $path : $baud")
+                detectedBaudRate = baud
+                return baud
+            }
+            AppLogger.d(logTag, "$path @ $baud baud : aucune trame NMEA valide")
+        }
+        AppLogger.w(logTag, "$path : aucun baud rate ne donne de trames NMEA valides")
+        return null
+    }
+
+    private fun probeNmea(path: String): Boolean {
+        return try {
+            FileInputStream(path).use { fis ->
+                val buffer = ByteArray(1024)
+                val sb = StringBuilder()
+                val deadline = System.currentTimeMillis() + BAUD_PROBE_DURATION_MS
+                var found = false
+                while (!found && System.currentTimeMillis() < deadline && isRunning) {
+                    val size = fis.read(buffer)
+                    if (size <= 0) { Thread.sleep(50); continue }
+                    sb.append(String(buffer, 0, size, Charsets.US_ASCII))
+                    found = NMEA_SENTENCE_REGEX.findAll(sb).count { verifyNmeaChecksum(it.value) } >= BAUD_PROBE_MIN_VALID_SENTENCES
+                }
+                found
+            }
+        } catch (e: Exception) {
+            AppLogger.w(logTag, "Erreur sondage $path : ${e.message}")
+            false
+        }
+    }
+
+    /** Retourne true si stty a appliqué la configuration. */
+    private fun configureSerialPort(path: String, baudRate: Int): Boolean {
         var process: Process? = null
         try {
-            val cmd = "stty -F $path $baudRate raw -echo -echoe -echok -echoctl -echoke cs8 -cstopb -parenb -crtscts"
+            // min 0 time 5 : read() rend la main après 0,5 s sans données au lieu de bloquer indéfiniment
+            val cmd = "stty -F $path $baudRate raw -echo -echoe -echok -echoctl -echoke cs8 -cstopb -parenb -crtscts min 0 time 5"
             process = Runtime.getRuntime().exec(arrayOf("/system/bin/sh", "-c", cmd))
             val exitCode = process.waitFor()
             if (exitCode == 0) {
                 AppLogger.i(logTag, "Port $path configuré : $baudRate baud")
+                return true
             } else {
                 val error = process.errorStream.bufferedReader().readText()
                 AppLogger.w(logTag, "stty exit=$exitCode : $error")
@@ -659,22 +794,29 @@ class PositionService : Service() {
             try { process?.errorStream?.close() } catch (_: Exception) {}
             try { process?.destroy() } catch (_: Exception) {}
         }
+        return false
     }
 
     // ─────────────────────────────────────────────
     // Thread de lecture série
     // ─────────────────────────────────────────────
 
-    private fun startSerialReadThread(path: String) {
+    private fun startSerialReadThread(path: String, autoBaud: Boolean) {
         readThread = Thread {
             val buffer = ByteArray(4096)
             val sb = StringBuilder()
             var lastHeartbeat = System.currentTimeMillis()
+            var lastValidSentence = System.currentTimeMillis()
             AppLogger.d(logTag, "Thread lecture série démarré : $path")
-            updateNotification("RTK connecté : $path")
+            updateNotification("RTK connecté : $path", force = true)
 
             while (isRunning) {
                 try {
+                    if (autoBaud && System.currentTimeMillis() - lastValidSentence > AUTO_BAUD_STALE_MS) {
+                        AppLogger.w(logTag, "Aucune trame valide depuis ${AUTO_BAUD_STALE_MS / 1000}s sur $path — nouvelle détection du baud rate")
+                        break
+                    }
+
                     val size = inputStream?.read(buffer) ?: -1
                     if (size <= 0) { Thread.sleep(10); continue }
 
@@ -699,7 +841,7 @@ class PositionService : Service() {
                             sb.delete(0, end + 1)
                             if (line.startsWith("$") && line.length > 10) {
                                 AppLogger.d("NMEA_RAW", line)
-                                parseNmeaLine(line)
+                                if (parseNmeaLine(line)) lastValidSentence = System.currentTimeMillis()
                             }
                         }
                     }
@@ -736,16 +878,20 @@ class PositionService : Service() {
     // Parsing NMEA
     // ─────────────────────────────────────────────
 
-    private fun parseNmeaLine(line: String) {
-        if (!line.startsWith("\$")) return
+    /** Retourne true si la trame est valide (checksum correct), qu'elle soit exploitée ou non. */
+    private fun parseNmeaLine(line: String): Boolean {
+        if (!line.startsWith("\$")) return false
         if (line.contains("*") && !verifyNmeaChecksum(line)) {
             AppLogger.w(logTag, "Checksum invalide: $line")
-            return
+            return false
         }
-        when {
-            line.contains("GGA") -> parseGga(line)
-            line.contains("RMC") -> parseRmc(line)
+        // En-tête : "$" + talker sur 2 caractères (GP, GN, GL...) + type de trame sur 3 caractères
+        if (line.length < 6) return false
+        when (line.substring(3, 6)) {
+            "GGA" -> parseGga(line)
+            "RMC" -> parseRmc(line)
         }
+        return true
     }
 
     private fun parseGga(line: String) {
@@ -812,7 +958,7 @@ class PositionService : Service() {
             val heading = parts[8].toDoubleOrNull() ?: 0.0
             currentSpeedMs = (speedKnots * 0.514444).toFloat()
             currentHeading = heading.toFloat()
-            AppLogger.d(logTag, "RMC speed=${String.format("%.2f", currentSpeedMs)}m/s heading=${String.format("%.1f", currentHeading)}°")
+            AppLogger.d(logTag, "RMC speed=${"%.2f".fmt(currentSpeedMs)}m/s heading=${"%.1f".fmt(currentHeading)}°")
         } catch (e: Exception) {
             AppLogger.e(logTag, "Erreur parsing RMC: ${e.message}")
         }
@@ -854,15 +1000,31 @@ class PositionService : Service() {
         }
     }
 
-    private fun createNotification(text: String) =
-        NotificationCompat.Builder(this, channelId)
+    private fun createNotification(text: String): Notification {
+        val openAppIntent = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(this, channelId)
             .setContentTitle("GPS Sender RTK")
             .setContentText(text)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_stat_gps)
+            .setContentIntent(openAppIntent)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
             .build()
+    }
 
-    private fun updateNotification(text: String) {
+    /**
+     * Les mises à jour de position (jusqu'à 10 Hz) sont limitées à 1/s : au-delà, Android ignore
+     * les notify() et le coût CPU est inutile. Les changements d'état passent avec force = true.
+     */
+    private fun updateNotification(text: String, force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        if (!force && now - lastNotificationUpdate < NOTIFICATION_MIN_INTERVAL_MS) return
+        lastNotificationUpdate = now
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
             .notify(notificationId, createNotification(text))
     }

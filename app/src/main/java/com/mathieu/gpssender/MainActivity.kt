@@ -1,7 +1,6 @@
 package com.mathieu.gpssender
 
 import android.Manifest
-import android.app.ActivityManager
 import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -27,6 +26,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var viewLogsButton: Button
 
     private lateinit var deviceIdEditText: TextInputEditText
+    private lateinit var apiUrlEditText: TextInputEditText
+    private lateinit var apiKeyEditText: TextInputEditText
     private lateinit var portSpinner: Spinner
     private lateinit var baudRateSpinner: Spinner
     private lateinit var refreshRateSpinner: Spinner
@@ -36,6 +37,9 @@ class MainActivity : AppCompatActivity() {
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
+            if (permissions[Manifest.permission.POST_NOTIFICATIONS] == false) {
+                AppLogger.w(TAG, "Permission POST_NOTIFICATIONS refusée — notification d'état masquée")
+            }
             if (permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true) {
                 AppLogger.d(TAG, "Permission ACCESS_FINE_LOCATION accordée")
                 checkPermissionsAndStart()
@@ -56,6 +60,8 @@ class MainActivity : AppCompatActivity() {
         viewLogsButton = findViewById(R.id.viewLogsButton)
 
         deviceIdEditText = findViewById(R.id.deviceIdEditText)
+        apiUrlEditText = findViewById(R.id.apiUrlEditText)
+        apiKeyEditText = findViewById(R.id.apiKeyEditText)
         portSpinner = findViewById(R.id.portSpinner)
         baudRateSpinner = findViewById(R.id.baudRateSpinner)
         refreshRateSpinner = findViewById(R.id.refreshRateSpinner)
@@ -72,8 +78,11 @@ class MainActivity : AppCompatActivity() {
         saveButton.setOnClickListener { savePreferences() }
 
         AppLogger.d(TAG, "MainActivity créée et UI initialisée")
+    }
+
+    override fun onResume() {
+        super.onResume()
         updateStatus()
-        GpsWatchdogWorker.schedule(this)
     }
 
     private fun setupSpinners() {
@@ -82,7 +91,7 @@ class MainActivity : AppCompatActivity() {
         portAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         portSpinner.adapter = portAdapter
 
-        val baudLabels = AppPreferences.AVAILABLE_BAUD_RATES.map { "$it baud" }
+        val baudLabels = AppPreferences.AVAILABLE_BAUD_RATES.map { AppPreferences.baudRateLabel(it) }
         val baudAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, baudLabels)
         baudAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         baudRateSpinner.adapter = baudAdapter
@@ -96,6 +105,8 @@ class MainActivity : AppCompatActivity() {
     private fun loadPreferences() {
         val currentDeviceId = AppPreferences.getDeviceId(this)
         deviceIdEditText.setText(currentDeviceId)
+        apiUrlEditText.setText(AppPreferences.getApiUrl(this))
+        apiKeyEditText.setText(AppPreferences.getApiKey(this))
 
         val currentPort = AppPreferences.getSerialPort(this)
         val portIndex = AppPreferences.AVAILABLE_PORTS.indexOfFirst { it.second == currentPort }
@@ -131,6 +142,18 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        val newApiUrl = apiUrlEditText.text.toString().trim()
+        if (!newApiUrl.startsWith("http://") && !newApiUrl.startsWith("https://")) {
+            apiUrlEditText.error = "L'URL doit commencer par http:// ou https://"
+            return
+        }
+
+        val newApiKey = apiKeyEditText.text.toString().trim()
+        if (newApiKey.isEmpty()) {
+            apiKeyEditText.error = "Veuillez saisir la clé API"
+            return
+        }
+
         val selectedPortIndex = portSpinner.selectedItemPosition
         val selectedPort = if (selectedPortIndex in AppPreferences.AVAILABLE_PORTS.indices) {
             AppPreferences.AVAILABLE_PORTS[selectedPortIndex].second
@@ -153,14 +176,16 @@ class MainActivity : AppCompatActivity() {
         }
 
         AppPreferences.setDeviceId(this, newDeviceId)
+        AppPreferences.setApiUrl(this, newApiUrl)
+        AppPreferences.setApiKey(this, newApiKey)
         AppPreferences.setSerialPort(this, selectedPort)
         AppPreferences.setBaudRate(this, selectedBaudRate)
         AppPreferences.setSendIntervalMs(this, selectedIntervalMs)
 
         Toast.makeText(this, "Paramètres enregistrés", Toast.LENGTH_SHORT).show()
-        AppLogger.d(TAG, "Paramètres sauvegardés: ID=$newDeviceId, Port=$selectedPort, Baud=$selectedBaudRate, Interval=${selectedIntervalMs}ms")
+        AppLogger.d(TAG, "Paramètres sauvegardés: ID=$newDeviceId, URL=$newApiUrl, Port=$selectedPort, Baud=${AppPreferences.baudRateLabel(selectedBaudRate)}, Interval=${selectedIntervalMs}ms")
 
-        if (isServiceRunning(PositionService::class.java)) {
+        if (PositionService.isActive) {
             val reloadIntent = Intent(this, PositionService::class.java).apply {
                 action = PositionService.ACTION_RELOAD_SETTINGS
             }
@@ -176,7 +201,11 @@ class MainActivity : AppCompatActivity() {
 
         if (!fineLocationGranted) {
             AppLogger.d(TAG, "Demande permission ACCESS_FINE_LOCATION")
-            requestPermissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
+            val permissions = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+            requestPermissionLauncher.launch(permissions.toTypedArray())
             return
         }
 
@@ -189,13 +218,13 @@ class MainActivity : AppCompatActivity() {
                 AppLogger.w(TAG, "Permission ACCESS_BACKGROUND_LOCATION manquante")
                 AlertDialog.Builder(this)
                     .setTitle("Permission en arrière-plan nécessaire")
-                    .setMessage("Veuillez autoriser le suivi permanent dans les paramètres.")
+                    .setMessage("Veuillez autoriser le suivi permanent (\"Toujours autoriser\") dans les paramètres pour que le service redémarre seul au boot.")
                     .setPositiveButton("Aller aux paramètres") { _, _ ->
                         val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
                         intent.data = Uri.fromParts("package", packageName, null)
                         startActivity(intent)
                     }
-                    .setNegativeButton("Plus tard", null)
+                    .setNegativeButton("Démarrer quand même") { _, _ -> startGPSService() }
                     .show()
                 return
             }
@@ -206,32 +235,28 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startGPSService() {
-        val intent = Intent(this, PositionService::class.java)
-        ContextCompat.startForegroundService(this, intent)
+        AppPreferences.setServiceEnabled(this, true)
+        PositionService.start(this)
+        GpsWatchdogWorker.schedule(this)
         AppLogger.d(TAG, "Service PositionService démarré")
-        updateStatus()
+        // Le service démarre de façon asynchrone : on laisse le temps à onStartCommand de s'exécuter
+        statusText.postDelayed({ updateStatus() }, STATUS_REFRESH_DELAY_MS)
     }
 
     private fun stopGPSService() {
-        val intent = Intent(this, PositionService::class.java)
-        stopService(intent)
-        AppLogger.d(TAG, "Service PositionService arrêté")
-        updateStatus()
+        AppPreferences.setServiceEnabled(this, false)
         GpsWatchdogWorker.cancel(this)
+        stopService(Intent(this, PositionService::class.java))
+        AppLogger.d(TAG, "Service PositionService arrêté")
+        statusText.postDelayed({ updateStatus() }, STATUS_REFRESH_DELAY_MS)
     }
 
     private fun updateStatus() {
-        val isRunning = isServiceRunning(PositionService::class.java)
-        statusText.text = if (isRunning) "GPS Sender en cours" else "GPS Sender arrêté"
-        AppLogger.d(TAG, "Status mis à jour: ${statusText.text}")
+        statusText.text = if (PositionService.isActive) "GPS Sender en cours" else "GPS Sender arrêté"
     }
 
-    private fun isServiceRunning(serviceClass: Class<*>): Boolean {
-        val manager = getSystemService(ACTIVITY_SERVICE) as ActivityManager
-        for (service in manager.getRunningServices(Int.MAX_VALUE)) {
-            if (serviceClass.name == service.service.className) return true
-        }
-        return false
+    companion object {
+        private const val STATUS_REFRESH_DELAY_MS = 500L
     }
 }
 
