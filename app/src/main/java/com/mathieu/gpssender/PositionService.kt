@@ -2,13 +2,16 @@ package com.mathieu.gpssender
 
 import android.Manifest
 import android.app.*
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
@@ -84,6 +87,7 @@ class PositionService : Service() {
     private var senderThread: Thread? = null
 
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     @Volatile private var isRunning = false
     @Volatile private var lastRtkTimestamp = 0L
@@ -91,6 +95,12 @@ class PositionService : Service() {
     @Volatile private var internalGpsActive = false
     @Volatile private var sendIntervalMs = AppPreferences.DEFAULT_SEND_INTERVAL_MS
     @Volatile private var lastNotificationUpdate = 0L
+    // Avertissement ajouté à la notification quand l'économie d'énergie bride le GPS (vide sinon)
+    @Volatile private var powerSaveWarning = ""
+
+    private val powerSaveReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) = checkLocationPowerSave()
+    }
 
     private val RTK_PRIORITY_TIMEOUT_MS = 10_000L
     private val RTK_GPS_CUTOFF_MS = 30_000L
@@ -176,7 +186,7 @@ class PositionService : Service() {
         }
         val rtkIsActive = (now - lastRtkTimestamp) < RTK_PRIORITY_TIMEOUT_MS
         if (!rtkIsActive) {
-            AppLogger.d(logTag, "GPS interne utilisé (RTK inactif)")
+            AppLogger.d(logTag, "GPS interne utilisé (RTK inactif) | fournisseur=${location.provider} ±${location.accuracy.roundToInt()}m")
             processLocation(
                 PendingLocation(
                     latitude = location.latitude,
@@ -184,7 +194,8 @@ class PositionService : Service() {
                     altitude = location.altitude,
                     accuracy = location.accuracy,
                     timestamp = now,
-                    source = "GPS Interne",
+                    // Une position réseau (Wi-Fi/antennes, ±100 m, ~1 toutes les 20 s) n'est pas un fix GPS
+                    source = if (location.provider == LocationManager.GPS_PROVIDER) "GPS Interne" else "Réseau",
                     speed = if (location.hasSpeed()) location.speed else 0f,
                     heading = if (location.hasBearing()) location.bearing else 0f
                 )
@@ -235,7 +246,29 @@ class PositionService : Service() {
         startInternalGps()
         startSenderThread()
 
+        registerReceiver(powerSaveReceiver, IntentFilter(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED))
+        checkLocationPowerSave()
+
         return START_STICKY
+    }
+
+    /**
+     * En mode Économie d'énergie, Android coupe (ou bride) le GPS écran éteint, même pour un service
+     * de premier plan : seules les positions réseau (~1 toutes les 20 s, ±100 m) arrivent alors.
+     * Aucune API ne permet de contourner ce réglage : on le signale à l'utilisateur.
+     */
+    private fun checkLocationPowerSave() {
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        val restricted = pm.isPowerSaveMode && (Build.VERSION.SDK_INT < Build.VERSION_CODES.P ||
+                pm.locationPowerSaveMode != PowerManager.LOCATION_MODE_NO_CHANGE)
+        if (restricted) {
+            AppLogger.w(logTag, "Économie d'énergie active : le GPS est coupé/bridé écran éteint — désactivez-la pour une cadence précise")
+            powerSaveWarning = " | ⚠️ Éco. d'énergie"
+            updateNotification("⚠️ Économie d'énergie active : GPS bridé écran éteint", force = true)
+        } else if (powerSaveWarning.isNotEmpty()) {
+            AppLogger.i(logTag, "Économie d'énergie désactivée — GPS à pleine cadence")
+            powerSaveWarning = ""
+        }
     }
 
     private fun reloadSettings() {
@@ -244,6 +277,7 @@ class PositionService : Service() {
         val newPort = AppPreferences.getSerialPort(this)
         val newInterval = AppPreferences.getSendIntervalMs(this)
         sendIntervalMs = newInterval
+        nextSendSlot = 0L
 
         AppLogger.i(logTag, "Paramètres rechargés: ID=$newDeviceId, Port=$newPort, Baud=${AppPreferences.baudRateLabel(newBaudRate)}, Interval=${newInterval}ms")
 
@@ -273,6 +307,7 @@ class PositionService : Service() {
     override fun onDestroy() {
         isRunning = false
         isActive = false
+        try { unregisterReceiver(powerSaveReceiver) } catch (_: Exception) {}
         reconnectThread?.interrupt()
         readThread?.interrupt()
         senderThread?.interrupt()
@@ -316,6 +351,20 @@ class PositionService : Service() {
         } catch (e: Exception) {
             AppLogger.e(logTag, "Erreur acquisition WakeLock", e)
         }
+
+        // Écran éteint, le Wi-Fi passe en économie d'énergie : les paquets sont regroupés et retardés
+        // de plusieurs centaines de ms, ce qui casse la cadence d'envoi (chaque envoi attend son ack)
+        try {
+            val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+            @Suppress("DEPRECATION")
+            wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "GpsSender:PositionServiceWifiLock").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            AppLogger.d(logTag, "WifiLock acquis")
+        } catch (e: Exception) {
+            AppLogger.e(logTag, "Erreur acquisition WifiLock", e)
+        }
     }
 
     private fun releaseWakeLock() {
@@ -324,6 +373,12 @@ class PositionService : Service() {
             wakeLock = null
         } catch (e: Exception) {
             AppLogger.e(logTag, "Erreur libération WakeLock", e)
+        }
+        try {
+            wifiLock?.let { if (it.isHeld) it.release() }
+            wifiLock = null
+        } catch (e: Exception) {
+            AppLogger.e(logTag, "Erreur libération WifiLock", e)
         }
     }
 
@@ -498,13 +553,17 @@ class PositionService : Service() {
             raw
         }
 
-        val minInterval = sendIntervalMs
+        val interval = sendIntervalMs
         val now = System.currentTimeMillis()
-        if (now - lastSentTimestamp < minInterval) {
-            AppLogger.d(logTag, "Throttle: ignoré (${raw.source}) [< ${minInterval}ms]")
+        // Tolérance : un fix arrivé un peu avant l'échéance (gigue du GPS, plus forte écran éteint) est accepté.
+        // Le rejeter ferait sauter un créneau entier (ex. 1 Hz → 0,5 Hz quand le GPS tourne à la même cadence).
+        if (now < nextSendSlot - interval / 4) {
+            AppLogger.d(logTag, "Throttle: ignoré (${raw.source}) [< ${interval}ms]")
             return
         }
-        lastSentTimestamp = now
+        // Créneau suivant calé sur l'échéance et non sur l'heure d'arrivée : pas de dérive ni d'accélération.
+        // Après une interruption (aucun fix pendant plus d'un intervalle), on se recale sur maintenant.
+        nextSendSlot = if (now - nextSendSlot > interval) now + interval else nextSendSlot + interval
         lastValidLocation = smoothed
 
         val queued = sendQueue.offer(smoothed)
@@ -514,12 +573,12 @@ class PositionService : Service() {
             val queueInfo = if (sendQueue.size > 1) " | file: ${sendQueue.size}" else ""
             updateNotification(
                 "${if (socketConnected) "🟢" else "🔴"} ${smoothed.source} | ${"%.7f".fmt(smoothed.latitude)}, " +
-                        "${"%.7f".fmt(smoothed.longitude)}$queueInfo"
+                        "${"%.7f".fmt(smoothed.longitude)}$queueInfo$powerSaveWarning"
             )
         }
     }
 
-    @Volatile private var lastSentTimestamp = 0L
+    @Volatile private var nextSendSlot = 0L
 
     /** Formatage indépendant de la locale (évite "48,1234567" en français). */
     private fun String.fmt(vararg args: Any): String = String.format(Locale.US, this, *args)
