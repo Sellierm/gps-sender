@@ -437,8 +437,11 @@ class PositionService : Service() {
 
                 // On s'abonne même aux fournisseurs désactivés : les positions arriveront dès que
                 // l'utilisateur réactivera la localisation, sans redémarrer le service.
-                val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
-                    .filter { it in locationManager.allProviders }
+                // Le fournisseur réseau ne livre qu'une position toutes les ~20 s ; le fusionné (API 31+)
+                // peut être plus rapide sans fix GPS. Ignoré tant que le GPS a un fix récent.
+                val candidates = mutableListOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) candidates += LocationManager.FUSED_PROVIDER
+                val providers = candidates.filter { it in locationManager.allProviders }
                 for (provider in providers) {
                     locationManager.requestLocationUpdates(provider, minTime, 0f, locationListener, Looper.getMainLooper())
                 }
