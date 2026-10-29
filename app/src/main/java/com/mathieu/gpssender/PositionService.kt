@@ -25,7 +25,9 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.InputStream
 import java.util.Locale
-import java.util.concurrent.LinkedBlockingQueue
+import org.json.JSONArray
+import java.time.LocalDate
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import kotlin.math.*
 
@@ -61,6 +63,12 @@ class PositionService : Service() {
         private const val AUTO_BAUD_STALE_MS = 15_000L
         private val NMEA_SENTENCE_REGEX = Regex("""\$[A-Z]{5},[^$*\r\n]*\*[0-9A-Fa-f]{2}""")
         private const val LOCATION_DISABLED_TEXT = "⚠️ Localisation désactivée sur l'appareil — aucune position"
+        private const val RTK_FIX_SOURCE = "RTK RTK Fix"
+        private const val DAY_MS = 24 * 60 * 60 * 1000L
+        // Au-delà, la date RMC est jugée périmée (récepteur qui n'émet plus de RMC) : on prend celle du téléphone
+        private const val RMC_DATE_MAX_AGE_MS = 5_000L
+        // Une trame GST n'est utilisée que si elle date de moins de 2 s (précision de l'époque courante)
+        private const val GST_MAX_AGE_MS = 2_000L
     }
 
     private val logTag = "GPS_SENDER_LOG"
@@ -107,24 +115,16 @@ class PositionService : Service() {
     private val MAX_SPEED_KMH = 200.0
 
     // ─────────────────────────────────────────────
-    // File d'attente locale (max 500 positions)
+    // File d'attente locale persistante (SQLite)
     // ─────────────────────────────────────────────
 
-    data class PendingLocation(
-        val latitude: Double,
-        val longitude: Double,
-        val altitude: Double,
-        val accuracy: Float,
-        val timestamp: Long,
-        val source: String,
-        val speed: Float = 0f,
-        val heading: Float = 0f
-    )
-
-    private val sendQueue = LinkedBlockingQueue<PendingLocation>(500)
+    private lateinit var locationQueue: LocationQueue
+    // Réveille le thread d'envoi dès qu'une position est ajoutée à la file
+    private val queueSignal = Semaphore(0)
+    private val BATCH_SIZE = 50
 
     // ─────────────────────────────────────────────
-    // Moyenne glissante sur 3 positions RTK
+    // Moyenne glissante sur 3 positions RTK Float (les RTK Fix ne sont pas lissés)
     // ─────────────────────────────────────────────
 
     private val positionBufferLock = Any()
@@ -138,11 +138,21 @@ class PositionService : Service() {
     @Volatile private var lastValidLocation: PendingLocation? = null
 
     // ─────────────────────────────────────────────
-    // Données RMC courantes (speed + heading)
+    // Données RMC courantes (speed + heading + date)
     // ─────────────────────────────────────────────
 
     @Volatile private var currentSpeedMs = 0f
     @Volatile private var currentHeading = 0f
+    // Date + heure UTC de la dernière RMC valide, et heure système de sa réception
+    @Volatile private var rmcEpochMs = 0L
+    @Volatile private var rmcReceivedAt = 0L
+
+    // ─────────────────────────────────────────────
+    // Données GST courantes (précision estimée par le récepteur)
+    // ─────────────────────────────────────────────
+
+    @Volatile private var gstHorizontalErrorM = 0f
+    @Volatile private var gstReceivedAt = 0L
 
     // ─────────────────────────────────────────────
     // Cycle de vie
@@ -152,6 +162,7 @@ class PositionService : Service() {
         super.onCreate()
         AppLogger.d(logTag, "PositionService onCreate()")
         createNotificationChannel()
+        locationQueue = LocationQueue(this)
         sendIntervalMs = AppPreferences.getSendIntervalMs(this)
 
         locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
@@ -550,10 +561,15 @@ class PositionService : Service() {
             }
         }
 
-        val smoothed = if (raw.source.startsWith("RTK")) {
-            smoothPosition(raw) ?: return
-        } else {
-            raw
+        // Un RTK Fix (±2 cm) n'est pas lissé : la moyenne glissante ajouterait un retard de
+        // ~30 cm à 3 m/s. Seul le RTK Float, plus bruité, est moyenné.
+        val smoothed = when {
+            raw.source == RTK_FIX_SOURCE -> {
+                synchronized(positionBufferLock) { positionBuffer.clear() }
+                raw
+            }
+            raw.source.startsWith("RTK") -> smoothPosition(raw) ?: return
+            else -> raw
         }
 
         val interval = sendIntervalMs
@@ -569,16 +585,19 @@ class PositionService : Service() {
         nextSendSlot = if (now - nextSendSlot > interval) now + interval else nextSendSlot + interval
         lastValidLocation = smoothed
 
-        val queued = sendQueue.offer(smoothed)
-        if (!queued) {
-            AppLogger.w(logTag, "File pleine (500), position ignorée")
-        } else {
-            val queueInfo = if (sendQueue.size > 1) " | file: ${sendQueue.size}" else ""
-            updateNotification(
-                "${if (socketConnected) "🟢" else "🔴"} ${smoothed.source} | ${"%.7f".fmt(smoothed.latitude)}, " +
-                        "${"%.7f".fmt(smoothed.longitude)}$queueInfo$powerSaveWarning"
-            )
+        try {
+            locationQueue.add(smoothed)
+        } catch (e: Exception) {
+            AppLogger.e(logTag, "Erreur écriture file d'attente, position perdue", e)
+            return
         }
+        queueSignal.release()
+        val queueSize = locationQueue.size()
+        val queueInfo = if (queueSize > 1) " | file: $queueSize" else ""
+        updateNotification(
+            "${if (socketConnected) "🟢" else "🔴"} ${smoothed.source} | ${"%.7f".fmt(smoothed.latitude)}, " +
+                    "${"%.7f".fmt(smoothed.longitude)}$queueInfo$powerSaveWarning"
+        )
     }
 
     @Volatile private var nextSendSlot = 0L
@@ -619,28 +638,31 @@ class PositionService : Service() {
             return
         }
         senderThread = Thread {
-            AppLogger.d(logTag, "Thread d'envoi démarré")
+            AppLogger.d(logTag, "Thread d'envoi démarré | file: ${locationQueue.size()}")
             var consecutiveFailures = 0
-            // Position en échec gardée hors file pour être renvoyée en premier (ordre chronologique préservé)
-            var inFlight: PendingLocation? = null
 
             while (isRunning) {
                 try {
-                    val pending = inFlight ?: sendQueue.poll(1, TimeUnit.SECONDS) ?: continue
+                    // Les positions restent en file jusqu'à l'ack : l'ordre chronologique est préservé
+                    // et rien n'est perdu si le service est tué pendant l'envoi.
+                    queueSignal.drainPermits()
+                    val batch = locationQueue.peek(BATCH_SIZE)
+                    if (batch == null) {
+                        queueSignal.tryAcquire(1, TimeUnit.SECONDS)
+                        continue
+                    }
 
-                    val success = trySendLocation(pending)
-
-                    if (success) {
-                        inFlight = null
+                    if (trySendBatch(batch)) {
+                        locationQueue.removeUpTo(batch.lastId)
                         consecutiveFailures = 0
-                        if (sendQueue.size > 0) {
-                            AppLogger.d(logTag, "File d'attente: ${sendQueue.size} positions restantes")
+                        val remaining = locationQueue.size()
+                        if (remaining > 0) {
+                            AppLogger.d(logTag, "File d'attente: $remaining positions restantes")
                         }
                     } else {
-                        inFlight = pending
                         consecutiveFailures++
                         val delay = minOf(2000L * (1 shl minOf(consecutiveFailures - 1, 3)), 30_000L)
-                        AppLogger.w(logTag, "Echec envoi ($consecutiveFailures), retry dans ${delay}ms | file: ${sendQueue.size}")
+                        AppLogger.w(logTag, "Echec envoi ($consecutiveFailures), retry dans ${delay}ms | file: ${locationQueue.size()}")
                         Thread.sleep(delay)
                     }
 
@@ -648,6 +670,8 @@ class PositionService : Service() {
                     break
                 } catch (e: Exception) {
                     AppLogger.e(logTag, "Erreur thread envoi [${e.javaClass.simpleName}]: ${e.message}")
+                    // Évite une boucle serrée si la base locale est en erreur
+                    try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
                 }
             }
             AppLogger.d(logTag, "Thread d'envoi arrêté")
@@ -658,12 +682,13 @@ class PositionService : Service() {
         }
     }
 
-    private fun trySendLocation(pending: PendingLocation): Boolean {
+    private fun trySendBatch(batch: QueuedBatch): Boolean {
+        // Non configuré : les positions sont conservées en file jusqu'à la configuration
         if (AppPreferences.getApiUrl(this).isBlank() || AppPreferences.getApiKey(this).isBlank() ||
             AppPreferences.getDeviceId(this).isBlank()
         ) {
-            AppLogger.w(logTag, "Socket non configuré — envoi ignoré")
-            return true
+            AppLogger.w(logTag, "Socket non configuré — envoi reporté")
+            return false
         }
 
         val client = socketClient
@@ -673,24 +698,29 @@ class PositionService : Service() {
         }
 
         return try {
-            val json = JSONObject().apply {
-                put("latitude", pending.latitude)
-                put("longitude", pending.longitude)
-                put("altitude", pending.altitude)
-                put("accuracy", pending.accuracy)
-                put("speed", pending.speed)
-                put("heading", pending.heading)
-                put("timestamp", pending.timestamp)
-                put("source", pending.source)
+            val points = JSONArray()
+            for (pending in batch.locations) {
+                points.put(JSONObject().apply {
+                    put("latitude", pending.latitude)
+                    put("longitude", pending.longitude)
+                    put("altitude", pending.altitude)
+                    put("accuracy", pending.accuracy)
+                    put("speed", pending.speed)
+                    put("heading", pending.heading)
+                    put("timestamp", pending.timestamp)
+                    put("source", pending.source)
+                })
             }
 
-            val success = client.sendLocation(json)
-            if (success) {
-                AppLogger.i(logTag, "Envoyé (${pending.source}) via socket | speed=${"%.2f".fmt(pending.speed)}m/s heading=${"%.1f".fmt(pending.heading)}°")
+            val result = client.sendBatch(points)
+            if (result.success) {
+                val last = batch.locations.last()
+                val rejectedInfo = if (result.rejected > 0) " | ${result.rejected} rejetée(s) par le serveur" else ""
+                AppLogger.i(logTag, "Envoyé ${batch.locations.size} position(s) (${last.source}) via socket | speed=${"%.2f".fmt(last.speed)}m/s heading=${"%.1f".fmt(last.heading)}°$rejectedInfo")
             } else {
-                AppLogger.w(logTag, "Échec ack socket")
+                AppLogger.w(logTag, "Échec ack socket${result.message?.let { " : $it" } ?: ""}")
             }
-            success
+            result.success
         } catch (e: Exception) {
             AppLogger.e(logTag, "Erreur envoi socket [${e.javaClass.simpleName}]: ${e.message}")
             false
@@ -910,7 +940,7 @@ class PositionService : Service() {
 
                     val now = System.currentTimeMillis()
                     if (now - lastHeartbeat > 10_000L) {
-                        AppLogger.d(logTag, "Thread série actif sur $path | file: ${sendQueue.size} | RTK: ${if ((now - lastRtkTimestamp) < RTK_PRIORITY_TIMEOUT_MS) "actif" else "inactif"} | socket: ${if (socketConnected) "connecté" else "déconnecté"}")
+                        AppLogger.d(logTag, "Thread série actif sur $path | file: ${locationQueue.size()} | RTK: ${if ((now - lastRtkTimestamp) < RTK_PRIORITY_TIMEOUT_MS) "actif" else "inactif"} | socket: ${if (socketConnected) "connecté" else "déconnecté"}")
                         lastHeartbeat = now
                     }
 
@@ -952,6 +982,7 @@ class PositionService : Service() {
         when (line.substring(3, 6)) {
             "GGA" -> parseGga(line)
             "RMC" -> parseRmc(line)
+            "GST" -> parseGst(line)
         }
         return true
     }
@@ -973,12 +1004,7 @@ class PositionService : Service() {
                 return
             }
 
-            val accuracy = when (quality) {
-                "4" -> 0.02f
-                "5" -> 0.30f
-                "2" -> 1.0f
-                else -> 5.0f
-            }
+            val accuracy = estimateAccuracy(quality, hdop)
 
             val qualityLabel = when (quality) {
                 "4" -> "RTK Fix"
@@ -988,7 +1014,7 @@ class PositionService : Service() {
                 else -> "Fix=$quality"
             }
 
-            AppLogger.i(logTag, "[$qualityLabel] lat=$lat lon=$lon alt=${altitude}m sats=$numSats hdop=$hdop")
+            AppLogger.i(logTag, "[$qualityLabel] lat=$lat lon=$lon alt=${altitude}m sats=$numSats hdop=$hdop ±${"%.3f".fmt(accuracy)}m")
 
             updateRtkStatus()
 
@@ -998,7 +1024,7 @@ class PositionService : Service() {
                     longitude = lon,
                     altitude = altitude,
                     accuracy = accuracy,
-                    timestamp = System.currentTimeMillis(),
+                    timestamp = gnssTimestamp(parts[1]),
                     source = "RTK $qualityLabel",
                     speed = currentSpeedMs,
                     heading = currentHeading
@@ -1020,10 +1046,87 @@ class PositionService : Service() {
             val heading = parts[8].toDoubleOrNull() ?: 0.0
             currentSpeedMs = (speedKnots * 0.514444).toFloat()
             currentHeading = heading.toFloat()
+            val timeOfDay = parseNmeaTimeOfDay(parts[1])
+            val dayStart = if (parts.size > 9) parseNmeaDate(parts[9]) else null
+            if (timeOfDay != null && dayStart != null) {
+                rmcEpochMs = dayStart + timeOfDay
+                rmcReceivedAt = System.currentTimeMillis()
+            }
             AppLogger.d(logTag, "RMC speed=${"%.2f".fmt(currentSpeedMs)}m/s heading=${"%.1f".fmt(currentHeading)}°")
         } catch (e: Exception) {
             AppLogger.e(logTag, "Erreur parsing RMC: ${e.message}")
         }
+    }
+
+    /** GST : écarts-types latitude/longitude estimés par le récepteur, en mètres. */
+    private fun parseGst(line: String) {
+        val parts = (if (line.contains("*")) line.substringBefore("*") else line).split(",")
+        if (parts.size < 8) return
+        val latErr = parts[6].toDoubleOrNull() ?: return
+        val lonErr = parts[7].toDoubleOrNull() ?: return
+        gstHorizontalErrorM = sqrt(latErr * latErr + lonErr * lonErr).toFloat()
+        gstReceivedAt = System.currentTimeMillis()
+    }
+
+    /**
+     * Précision horizontale (m) : celle de la trame GST si le récepteur en émet,
+     * sinon une valeur type selon la qualité du fix, pondérée par le HDOP.
+     */
+    private fun estimateAccuracy(quality: String, hdop: Double): Float {
+        if (System.currentTimeMillis() - gstReceivedAt < GST_MAX_AGE_MS && gstHorizontalErrorM > 0f) {
+            return gstHorizontalErrorM
+        }
+        val typical = when (quality) {
+            "4" -> 0.02f
+            "5" -> 0.30f
+            "2" -> 1.0f
+            else -> 5.0f
+        }
+        return if (hdop > 0.0) typical * hdop.toFloat() else typical
+    }
+
+    /** "hhmmss.ss" → millisecondes depuis minuit UTC. */
+    private fun parseNmeaTimeOfDay(value: String): Long? {
+        if (value.length < 6) return null
+        val hours = value.substring(0, 2).toIntOrNull() ?: return null
+        val minutes = value.substring(2, 4).toIntOrNull() ?: return null
+        val seconds = value.substring(4).toDoubleOrNull() ?: return null
+        if (hours > 23 || minutes > 59 || seconds < 0.0 || seconds >= 61.0) return null
+        return (hours * 3600 + minutes * 60) * 1000L + (seconds * 1000).roundToLong()
+    }
+
+    /** "ddmmyy" → minuit UTC de ce jour, en ms epoch. */
+    private fun parseNmeaDate(value: String): Long? {
+        if (value.length != 6) return null
+        return try {
+            LocalDate.of(
+                2000 + value.substring(4, 6).toInt(),
+                value.substring(2, 4).toInt(),
+                value.substring(0, 2).toInt()
+            ).toEpochDay() * DAY_MS
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Horodatage du fix : heure UTC de la trame GGA (instant de la mesure, et non de la réception),
+     * datée par la dernière RMC ou, à défaut, par l'horloge du téléphone.
+     * On retient le jour (veille, même jour ou lendemain) qui place le fix au plus près de la
+     * référence : gère le passage de minuit entre la RMC et la GGA.
+     */
+    private fun gnssTimestamp(ggaTime: String): Long {
+        val now = System.currentTimeMillis()
+        val timeOfDay = parseNmeaTimeOfDay(ggaTime) ?: return now
+        val reference = if (rmcEpochMs > 0L && now - rmcReceivedAt < RMC_DATE_MAX_AGE_MS) {
+            rmcEpochMs + (now - rmcReceivedAt)
+        } else {
+            now
+        }
+        val dayStart = Math.floorDiv(reference, DAY_MS) * DAY_MS
+        return listOf(dayStart - DAY_MS, dayStart, dayStart + DAY_MS)
+            .map { it + timeOfDay }
+            .minBy { abs(it - reference) }
     }
 
     private fun convertNmeaToDecimal(value: String, direction: String): Double {
@@ -1040,11 +1143,11 @@ class PositionService : Service() {
         return try {
             val start = sentence.indexOf('$') + 1
             val end = sentence.indexOf('*')
-            if (start < 1 || end < 0 || end <= start) return true
+            if (start < 1 || end < 0 || end <= start || sentence.length < end + 3) return false
             val data = sentence.substring(start, end)
-            val expected = sentence.substring(end + 1, minOf(end + 3, sentence.length)).toInt(16)
+            val expected = sentence.substring(end + 1, end + 3).toInt(16)
             data.fold(0) { acc, c -> acc xor c.code } == expected
-        } catch (_: Exception) { true }
+        } catch (_: Exception) { false }
     }
 
     // ─────────────────────────────────────────────
