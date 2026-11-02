@@ -61,9 +61,12 @@ class LocationSocketClient(
                 reconnectionDelay = 2000
                 reconnectionDelayMax = 15000
                 timeout = 8000
+                // appVersion : affichée dans les journaux du serveur (≥ 2.1.2),
+                // ignorée par les serveurs plus anciens.
                 auth = mapOf(
                     "deviceId" to deviceId,
                     "key" to apiKey,
+                    "appVersion" to BuildConfig.VERSION_NAME,
                 )
             }
             val s = IO.socket(url, options)

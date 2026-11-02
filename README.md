@@ -9,7 +9,7 @@ L'application est spécialement optimisée pour les tablettes professionnelles (
 ## 🚀 Fonctionnalités principales
 
 - **Lecture directe du port série RTK** : Détection et lecture des trames NMEA (`$GNGGA`, `$GNRMC`) depuis le port série configuré ou en auto-détection (`/dev/ttyS*`, `/dev/ttyUSB*`).
-- **Connexion Socket.IO persisante** : Transmission via une connexion WebSocket réutilisée avec authentification par handshake (`deviceId` + `apiKey`), acquittement d'envoi (ACK) et reconnexion automatique.
+- **Connexion Socket.IO persisante** : Transmission via une connexion WebSocket réutilisée avec authentification par handshake (`deviceId` + `apiKey`, plus la version de l'app pour les journaux du serveur), acquittement d'envoi (ACK) et reconnexion automatique.
 - **Traitement et filtrage intelligent des positions** :
   - **Lissage** par moyenne glissante sur 3 positions RTK consécutives.
   - **Filtre anti-vitesse aberrante** (positions avec vitesse > 200 km/h ignorées).
