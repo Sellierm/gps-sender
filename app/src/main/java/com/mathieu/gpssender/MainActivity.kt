@@ -1,12 +1,15 @@
 package com.mathieu.gpssender
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.AlertDialog
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -241,6 +244,30 @@ class MainActivity : AppCompatActivity() {
         AppLogger.d(TAG, "Service PositionService démarré")
         // Le service démarre de façon asynchrone : on laisse le temps à onStartCommand de s'exécuter
         statusText.postDelayed({ updateStatus() }, STATUS_REFRESH_DELAY_MS)
+        requestBatteryOptimizationExemption()
+    }
+
+    /**
+     * Sans cette exemption, Android 12+ refuse au watchdog de relancer le service depuis l'arrière-plan
+     * et Doze peut retarder les envois. Le système affiche sa propre demande de confirmation.
+     */
+    private fun requestBatteryOptimizationExemption() {
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        AppLogger.i(TAG, "Demande d'exemption d'optimisation de batterie")
+        try {
+            @SuppressLint("BatteryLife") // Appli de suivi de flotte : le service doit tourner en continu
+            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
+            startActivity(intent)
+        } catch (e: ActivityNotFoundException) {
+            // Certains constructeurs n'exposent pas cette demande : on ouvre la liste des applis à la place
+            AppLogger.w(TAG, "Demande d'exemption indisponible, ouverture des paramètres de batterie")
+            try {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (_: ActivityNotFoundException) {
+                AppLogger.e(TAG, "Paramètres d'optimisation de batterie introuvables sur cet appareil")
+            }
+        }
     }
 
     private fun stopGPSService() {

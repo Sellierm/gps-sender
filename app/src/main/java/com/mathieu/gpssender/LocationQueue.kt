@@ -85,7 +85,6 @@ class LocationQueue(context: Context) :
         if (writableDatabase.insert(TABLE, null, values) != -1L) cachedSize++
     }
 
-    /** Les [limit] positions les plus anciennes, sans les retirer de la file. */
     @Synchronized
     fun peek(limit: Int): QueuedBatch? {
         val locations = mutableListOf<PendingLocation>()
