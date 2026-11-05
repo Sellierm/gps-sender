@@ -17,3 +17,10 @@ local.properties
 # Claude Code (local)
 .claude/
 CLAUDE.md
+
+# APK générés par Android Studio (Generate Signed APK)
+/app/release/
+
+# Configuration locale d'Android Studio (seul le style de code est partagé)
+/.idea/*
+!/.idea/codeStyles/

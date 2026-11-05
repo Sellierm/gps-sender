@@ -17,8 +17,8 @@ android {
         applicationId = "com.mathieu.gpssender"
         minSdk = 26
         targetSdk = 36
-        versionCode = 5
-        versionName = "2.1.2"
+        versionCode = 6
+        versionName = "2.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -30,13 +30,34 @@ android {
         buildConfig = true
     }
 
+    // Signature des releases en CI (voir .github/workflows/release.yml). Sans ces variables,
+    // la release reste signable comme avant via Android Studio (Build > Generate Signed APK).
+    val keystorePath = System.getenv("SIGNING_KEYSTORE_PATH")
+    signingConfigs {
+        if (!keystorePath.isNullOrBlank()) {
+            create("release") {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("SIGNING_STORE_PASSWORD")
+                keyAlias = System.getenv("SIGNING_KEY_ALIAS")
+                keyPassword = System.getenv("SIGNING_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // Les APK de release sont publiés sur un dépôt public : jamais de clé API ni d'URL
+            // intégrées. Elles se saisissent dans l'écran de réglages de l'appli.
+            buildConfigField("String", "API_KEY", "\"\"")
+            buildConfigField("String", "API_URL", "\"\"")
+
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfigs.findByName("release")?.let { signingConfig = it }
         }
     }
     compileOptions {
@@ -51,7 +72,6 @@ dependencies {
     implementation(libs.androidx.appcompat)
     implementation(libs.material)
     implementation(libs.androidx.activity)
-    implementation(libs.androidx.constraintlayout)
     implementation(libs.socket.io.client)
     // Force une version récente d'OkHttp (socket.io-client embarque OkHttp 3.x par défaut)
     implementation(libs.okhttp)

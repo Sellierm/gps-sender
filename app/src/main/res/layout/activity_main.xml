@@ -23,7 +23,6 @@
             android:layout_marginTop="12dp"
             android:layout_marginBottom="20dp" />
 
-        <!-- Card Statut & Contrôle -->
         <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -88,7 +87,6 @@
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
-        <!-- Card Configuration -->
         <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -111,7 +109,6 @@
                     android:textColor="@android:color/white"
                     android:layout_marginBottom="16dp" />
 
-                <!-- Champ ID Appareil -->
                 <com.google.android.material.textfield.TextInputLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -130,7 +127,6 @@
                         android:textSize="16sp" />
                 </com.google.android.material.textfield.TextInputLayout>
 
-                <!-- Champ URL serveur -->
                 <com.google.android.material.textfield.TextInputLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -149,7 +145,6 @@
                         android:textSize="16sp" />
                 </com.google.android.material.textfield.TextInputLayout>
 
-                <!-- Champ clé API (masquée, affichable via l'icône œil) -->
                 <com.google.android.material.textfield.TextInputLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -170,7 +165,6 @@
                         android:textSize="16sp" />
                 </com.google.android.material.textfield.TextInputLayout>
 
-                <!-- Champ Port Série -->
                 <TextView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -187,7 +181,6 @@
                     android:background="@android:drawable/btn_dropdown"
                     android:backgroundTint="#37474F" />
 
-                <!-- Champ Baud Rate -->
                 <TextView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -204,7 +197,6 @@
                     android:background="@android:drawable/btn_dropdown"
                     android:backgroundTint="#37474F" />
 
-                <!-- Champ Taux de rafraîchissement -->
                 <TextView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -221,7 +213,6 @@
                     android:background="@android:drawable/btn_dropdown"
                     android:backgroundTint="#37474F" />
 
-                <!-- Bouton Sauvegarder -->
                 <Button
                     android:id="@+id/saveButton"
                     android:layout_width="match_parent"

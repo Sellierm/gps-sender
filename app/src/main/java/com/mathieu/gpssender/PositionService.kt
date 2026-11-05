@@ -14,6 +14,7 @@ import android.location.LocationManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
@@ -23,10 +24,8 @@ import androidx.core.location.LocationManagerCompat
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
-import java.io.InputStream
 import java.util.Locale
 import org.json.JSONArray
-import java.time.LocalDate
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import kotlin.math.*
@@ -64,11 +63,14 @@ class PositionService : Service() {
         private val NMEA_SENTENCE_REGEX = Regex("""\$[A-Z]{5},[^$*\r\n]*\*[0-9A-Fa-f]{2}""")
         private const val LOCATION_DISABLED_TEXT = "⚠️ Localisation désactivée sur l'appareil — aucune position"
         private const val RTK_FIX_SOURCE = "RTK RTK Fix"
-        private const val DAY_MS = 24 * 60 * 60 * 1000L
         // Au-delà, la date RMC est jugée périmée (récepteur qui n'émet plus de RMC) : on prend celle du téléphone
         private const val RMC_DATE_MAX_AGE_MS = 5_000L
         // Une trame GST n'est utilisée que si elle date de moins de 2 s (précision de l'époque courante)
         private const val GST_MAX_AGE_MS = 2_000L
+        // Le WakeLock est pris pour 1 h et renouvelé toutes les 10 min tant que le service tourne :
+        // pas d'expiration en cours de route, et il retombe de lui-même si le service se bloque.
+        private const val WAKE_LOCK_TIMEOUT_MS = 60 * 60 * 1000L
+        private const val WAKE_LOCK_RENEW_MS = 10 * 60 * 1000L
     }
 
     private val logTag = "GPS_SENDER_LOG"
@@ -78,24 +80,31 @@ class PositionService : Service() {
     @Volatile private var lastInternalGpsFix = 0L
     private val GPS_PREFERRED_WINDOW_MS = 5_000L
 
-    // ─────────────────────────────────────────────
-    // Envoi des positions — Socket.IO persistant
-    // ─────────────────────────────────────────────
-
     @Volatile private var socketClient: LocationSocketClient? = null
     @Volatile private var socketConnected = false
 
     private val notificationId = 1
     private val channelId = "PositionServiceChannel"
 
-    private var serialFileStream: FileInputStream? = null
-    private var inputStream: InputStream? = null
-    private var readThread: Thread? = null
+    // Flux du port série ouvert ; le thread de lecture s'arrête dès qu'il ne correspond plus au sien
+    @Volatile private var serialFileStream: FileInputStream? = null
+    @Volatile private var readThread: Thread? = null
     private var reconnectThread: Thread? = null
     private var senderThread: Thread? = null
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val wakeLockRenewer = object : Runnable {
+        override fun run() {
+            try {
+                wakeLock?.acquire(WAKE_LOCK_TIMEOUT_MS)
+            } catch (e: Exception) {
+                AppLogger.e(logTag, "Erreur renouvellement WakeLock", e)
+            }
+            mainHandler.postDelayed(this, WAKE_LOCK_RENEW_MS)
+        }
+    }
 
     @Volatile private var isRunning = false
     @Volatile private var lastRtkTimestamp = 0L
@@ -112,34 +121,22 @@ class PositionService : Service() {
 
     private val RTK_PRIORITY_TIMEOUT_MS = 10_000L
     private val RTK_GPS_CUTOFF_MS = 30_000L
-    private val MAX_SPEED_KMH = 200.0
-
-    // ─────────────────────────────────────────────
-    // File d'attente locale persistante (SQLite)
-    // ─────────────────────────────────────────────
+    // Une dernière position connue plus ancienne n'est pas réinjectée : elle serait envoyée comme
+    // position actuelle alors que l'appareil a pu être déplacé depuis
+    private val LAST_KNOWN_MAX_AGE_MS = 60_000L
 
     private lateinit var locationQueue: LocationQueue
     // Réveille le thread d'envoi dès qu'une position est ajoutée à la file
     private val queueSignal = Semaphore(0)
+    // Réveille le thread d'envoi en attente après un échec dès que le socket se reconnecte
+    private val connectionSignal = Semaphore(0)
     private val BATCH_SIZE = 50
-
-    // ─────────────────────────────────────────────
-    // Moyenne glissante sur 3 positions RTK Float (les RTK Fix ne sont pas lissés)
-    // ─────────────────────────────────────────────
 
     private val positionBufferLock = Any()
     private val positionBuffer = ArrayDeque<PendingLocation>()
     private val SMOOTHING_COUNT = 3
 
-    // ─────────────────────────────────────────────
-    // Filtre vitesse aberrante
-    // ─────────────────────────────────────────────
-
     @Volatile private var lastValidLocation: PendingLocation? = null
-
-    // ─────────────────────────────────────────────
-    // Données RMC courantes (speed + heading + date)
-    // ─────────────────────────────────────────────
 
     @Volatile private var currentSpeedMs = 0f
     @Volatile private var currentHeading = 0f
@@ -147,16 +144,11 @@ class PositionService : Service() {
     @Volatile private var rmcEpochMs = 0L
     @Volatile private var rmcReceivedAt = 0L
 
-    // ─────────────────────────────────────────────
-    // Données GST courantes (précision estimée par le récepteur)
-    // ─────────────────────────────────────────────
-
     @Volatile private var gstHorizontalErrorM = 0f
     @Volatile private var gstReceivedAt = 0L
 
-    // ─────────────────────────────────────────────
-    // Cycle de vie
-    // ─────────────────────────────────────────────
+    // Qualité de la dernière GGA : seuls ses changements sont journalisés (pas chaque fix à 10 Hz)
+    @Volatile private var lastGgaQuality: String? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -197,7 +189,7 @@ class PositionService : Service() {
         }
         val rtkIsActive = (now - lastRtkTimestamp) < RTK_PRIORITY_TIMEOUT_MS
         if (!rtkIsActive) {
-            AppLogger.d(logTag, "GPS interne utilisé (RTK inactif) | fournisseur=${location.provider} ±${location.accuracy.roundToInt()}m")
+            AppLogger.trace(logTag) { "GPS interne utilisé (RTK inactif) | fournisseur=${location.provider} ±${location.accuracy.roundToInt()}m" }
             processLocation(
                 PendingLocation(
                     latitude = location.latitude,
@@ -212,7 +204,7 @@ class PositionService : Service() {
                 )
             )
         } else {
-            AppLogger.d(logTag, "GPS interne ignoré (RTK actif)")
+            AppLogger.trace(logTag) { "GPS interne ignoré (RTK actif)" }
         }
     }
 
@@ -259,8 +251,18 @@ class PositionService : Service() {
 
         registerReceiver(powerSaveReceiver, IntentFilter(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED))
         checkLocationPowerSave()
+        logBatteryOptimization()
 
         return START_STICKY
+    }
+
+    private fun logBatteryOptimization() {
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) {
+            AppLogger.i(logTag, "Optimisation de batterie désactivée pour l'appli : relance par le watchdog possible")
+        } else {
+            AppLogger.w(logTag, "Optimisation de batterie active : sur Android 12+, le watchdog ne pourra pas relancer le service")
+        }
     }
 
     /**
@@ -301,11 +303,12 @@ class PositionService : Service() {
         }
         connectSocket()
 
-        try {
-            serialFileStream?.close()
-        } catch (_: Exception) {}
+        // Fermer le flux et le retirer suffit à arrêter le thread de lecture (il vérifie que le flux
+        // est toujours le sien) ; le ReconnectThread rouvre ensuite le port avec les nouveaux paramètres.
+        val stream = serialFileStream
         serialFileStream = null
-        inputStream = null
+        try { stream?.close() } catch (_: Exception) {}
+        readThread?.interrupt()
 
         if (internalGpsActive) {
             stopInternalGps("mise à jour de la cadence")
@@ -318,6 +321,7 @@ class PositionService : Service() {
     override fun onDestroy() {
         isRunning = false
         isActive = false
+        mainHandler.removeCallbacks(wakeLockRenewer)
         try { unregisterReceiver(powerSaveReceiver) } catch (_: Exception) {}
         reconnectThread?.interrupt()
         readThread?.interrupt()
@@ -344,10 +348,6 @@ class PositionService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // ─────────────────────────────────────────────
-    // Wake lock
-    // ─────────────────────────────────────────────
-
     private fun acquireWakeLock() {
         try {
             val pm = getSystemService(POWER_SERVICE) as PowerManager
@@ -355,10 +355,13 @@ class PositionService : Service() {
                 PowerManager.PARTIAL_WAKE_LOCK,
                 "GpsSender:PositionServiceWakeLock"
             ).apply {
+                // Non compté : chaque acquire() repousse simplement l'échéance
                 setReferenceCounted(false)
-                acquire(12 * 60 * 60 * 1000L)
+                acquire(WAKE_LOCK_TIMEOUT_MS)
             }
-            AppLogger.d(logTag, "WakeLock acquis")
+            mainHandler.removeCallbacks(wakeLockRenewer)
+            mainHandler.postDelayed(wakeLockRenewer, WAKE_LOCK_RENEW_MS)
+            AppLogger.d(logTag, "WakeLock acquis (renouvelé toutes les ${WAKE_LOCK_RENEW_MS / 60_000} min)")
         } catch (e: Exception) {
             AppLogger.e(logTag, "Erreur acquisition WakeLock", e)
         }
@@ -393,10 +396,6 @@ class PositionService : Service() {
         }
     }
 
-    // ─────────────────────────────────────────────
-    // Connexion Socket.IO
-    // ─────────────────────────────────────────────
-
     private fun connectSocket() {
         val currentDeviceId = AppPreferences.getDeviceId(this)
         val apiUrl = AppPreferences.getApiUrl(this)
@@ -417,6 +416,7 @@ class PositionService : Service() {
         client.connect(apiUrl, object : LocationSocketClient.StatusListener {
             override fun onConnected() {
                 socketConnected = true
+                connectionSignal.release()
                 updateNotification("Serveur connecté (ID: $currentDeviceId)", force = true)
             }
 
@@ -430,10 +430,6 @@ class PositionService : Service() {
             }
         })
     }
-
-    // ─────────────────────────────────────────────
-    // Gestion GPS interne (fallback si pas de RTK)
-    // ─────────────────────────────────────────────
 
     private val internalGpsLock = Any()
 
@@ -467,8 +463,13 @@ class PositionService : Service() {
 
                 val lastKnown = getBestLastKnownLocation()
                 if (lastKnown != null) {
-                    AppLogger.d(logTag, "Dernière position connue trouvée (lat=${lastKnown.latitude}, lon=${lastKnown.longitude})")
-                    locationListener.onLocationChanged(lastKnown)
+                    val ageMs = System.currentTimeMillis() - lastKnown.time
+                    if (ageMs < LAST_KNOWN_MAX_AGE_MS) {
+                        AppLogger.d(logTag, "Dernière position connue récente (lat=${lastKnown.latitude}, lon=${lastKnown.longitude}, il y a ${ageMs / 1000}s)")
+                        locationListener.onLocationChanged(lastKnown)
+                    } else {
+                        AppLogger.d(logTag, "Dernière position connue trop ancienne (${ageMs / 60_000} min), ignorée")
+                    }
                 }
             } else {
                 AppLogger.w(logTag, "Permission localisation manquante pour le GPS interne (fallback)")
@@ -532,33 +533,20 @@ class PositionService : Service() {
 
     private fun onRtkLost() {
         rtkActiveStartTimestamp = 0L
+        lastGgaQuality = null
         synchronized(positionBufferLock) { positionBuffer.clear() }
         restoreInternalGps()
         AppLogger.w(logTag, "RTK perdu/inactif — bascule sur GPS interne de secours")
     }
 
-    // ─────────────────────────────────────────────
-    // Traitement des positions (filtrage + lissage + cadencement)
-    // ─────────────────────────────────────────────
-
     // Appelé depuis le main looper (GPS interne) et le thread série (RTK) : sérialisé pour le throttle
     @Synchronized
     private fun processLocation(raw: PendingLocation) {
         val last = lastValidLocation
-        if (last != null) {
-            // On retranche l'incertitude des deux positions : un saut d'une position réseau (±400 m)
-            // vers un fix GPS précis n'est pas un déplacement réel et ne doit pas bloquer les fix suivants
-            val uncertaintyM = last.accuracy + raw.accuracy
-            val distanceM = (haversineDistance(last.latitude, last.longitude, raw.latitude, raw.longitude) - uncertaintyM)
-                .coerceAtLeast(0.0)
-            val deltaMs = raw.timestamp - last.timestamp
-            if (deltaMs > 0) {
-                val speedKmh = (distanceM / deltaMs) * 3600.0
-                if (speedKmh > MAX_SPEED_KMH) {
-                    AppLogger.w(logTag, "Position aberrante ignorée: ${"%.1f".fmt(speedKmh)} km/h")
-                    return
-                }
-            }
+        if (last != null && SpeedFilter.isAberrant(last, raw)) {
+            val speedKmh = SpeedFilter.apparentSpeedKmh(last, raw) ?: 0.0
+            AppLogger.w(logTag, "Position aberrante ignorée: ${"%.1f".fmt(speedKmh)} km/h")
+            return
         }
 
         // Un RTK Fix (±2 cm) n'est pas lissé : la moyenne glissante ajouterait un retard de
@@ -577,7 +565,7 @@ class PositionService : Service() {
         // Tolérance : un fix arrivé un peu avant l'échéance (gigue du GPS, plus forte écran éteint) est accepté.
         // Le rejeter ferait sauter un créneau entier (ex. 1 Hz → 0,5 Hz quand le GPS tourne à la même cadence).
         if (now < nextSendSlot - interval / 4) {
-            AppLogger.d(logTag, "Throttle: ignoré (${raw.source}) [< ${interval}ms]")
+            AppLogger.trace(logTag) { "Throttle: ignoré (${raw.source}) [< ${interval}ms]" }
             return
         }
         // Créneau suivant calé sur l'échéance et non sur l'heure d'arrivée : pas de dérive ni d'accélération.
@@ -619,19 +607,6 @@ class PositionService : Service() {
         }
     }
 
-    private fun haversineDistance(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
-        val R = 6371000.0
-        val dLat = Math.toRadians(lat2 - lat1)
-        val dLon = Math.toRadians(lon2 - lon1)
-        val a = sin(dLat / 2).pow(2) +
-                cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) * sin(dLon / 2).pow(2)
-        return R * 2 * atan2(sqrt(a), sqrt(1 - a))
-    }
-
-    // ─────────────────────────────────────────────
-    // Thread d'envoi avec file d'attente (Socket.IO)
-    // ─────────────────────────────────────────────
-
     private fun startSenderThread() {
         if (senderThread?.isAlive == true) {
             AppLogger.d(logTag, "startSenderThread ignoré : déjà actif")
@@ -655,15 +630,17 @@ class PositionService : Service() {
                     if (trySendBatch(batch)) {
                         locationQueue.removeUpTo(batch.lastId)
                         consecutiveFailures = 0
+                        connectionSignal.drainPermits()
                         val remaining = locationQueue.size()
                         if (remaining > 0) {
                             AppLogger.d(logTag, "File d'attente: $remaining positions restantes")
                         }
                     } else {
                         consecutiveFailures++
-                        val delay = minOf(2000L * (1 shl minOf(consecutiveFailures - 1, 3)), 30_000L)
-                        AppLogger.w(logTag, "Echec envoi ($consecutiveFailures), retry dans ${delay}ms | file: ${locationQueue.size()}")
-                        Thread.sleep(delay)
+                        // 2, 4, 8 puis 16 s ; une reconnexion du socket écourte l'attente
+                        val delay = 2000L shl minOf(consecutiveFailures - 1, 3)
+                        AppLogger.w(logTag, "Echec envoi ($consecutiveFailures), retry dans ${delay}ms ou dès la reconnexion | file: ${locationQueue.size()}")
+                        connectionSignal.tryAcquire(delay, TimeUnit.MILLISECONDS)
                     }
 
                 } catch (e: InterruptedException) {
@@ -726,10 +703,6 @@ class PositionService : Service() {
             false
         }
     }
-
-    // ─────────────────────────────────────────────
-    // Port série — détection et reconnexion
-    // ─────────────────────────────────────────────
 
     private fun startAutoDetectAndRead() {
         if (reconnectThread?.isAlive == true) {
@@ -807,9 +780,8 @@ class PositionService : Service() {
                 }
                 val fis = FileInputStream(device)
                 serialFileStream = fis
-                inputStream = fis
                 AppLogger.i(logTag, "Port série ouvert : $path @ $baudRate baud${if (autoBaud) " (auto-détecté)" else ""}")
-                startSerialReadThread(path, autoBaud)
+                startSerialReadThread(path, fis, autoBaud)
                 return true
             } catch (e: Exception) {
                 AppLogger.w(logTag, "Echec $path : ${e.message}")
@@ -818,10 +790,6 @@ class PositionService : Service() {
         return false
     }
 
-    /**
-     * Essaie chaque baud rate jusqu'à lire des trames NMEA au checksum valide.
-     * Retourne la vitesse trouvée, ou null si aucune ne convient.
-     */
     private fun detectBaudRate(path: String): Int? {
         val candidates = (listOfNotNull(detectedBaudRate) + AppPreferences.AUTO_DETECT_BAUD_ORDER).distinct()
         AppLogger.i(logTag, "Auto-détection du baud rate sur $path...")
@@ -853,7 +821,7 @@ class PositionService : Service() {
                     val size = fis.read(buffer)
                     if (size <= 0) { Thread.sleep(50); continue }
                     sb.append(String(buffer, 0, size, Charsets.US_ASCII))
-                    found = NMEA_SENTENCE_REGEX.findAll(sb).count { verifyNmeaChecksum(it.value) } >= BAUD_PROBE_MIN_VALID_SENTENCES
+                    found = NMEA_SENTENCE_REGEX.findAll(sb).count { Nmea.verifyChecksum(it.value) } >= BAUD_PROBE_MIN_VALID_SENTENCES
                 }
                 found
             }
@@ -889,11 +857,7 @@ class PositionService : Service() {
         return false
     }
 
-    // ─────────────────────────────────────────────
-    // Thread de lecture série
-    // ─────────────────────────────────────────────
-
-    private fun startSerialReadThread(path: String, autoBaud: Boolean) {
+    private fun startSerialReadThread(path: String, stream: FileInputStream, autoBaud: Boolean) {
         readThread = Thread {
             val buffer = ByteArray(4096)
             val sb = StringBuilder()
@@ -904,12 +868,17 @@ class PositionService : Service() {
 
             while (isRunning) {
                 try {
+                    // Flux fermé ou remplacé (rechargement des paramètres) : on rend la main au ReconnectThread
+                    if (serialFileStream !== stream) {
+                        AppLogger.i(logTag, "Port série $path fermé — réouverture avec les nouveaux paramètres")
+                        break
+                    }
                     if (autoBaud && System.currentTimeMillis() - lastValidSentence > AUTO_BAUD_STALE_MS) {
                         AppLogger.w(logTag, "Aucune trame valide depuis ${AUTO_BAUD_STALE_MS / 1000}s sur $path — nouvelle détection du baud rate")
                         break
                     }
 
-                    val size = inputStream?.read(buffer) ?: -1
+                    val size = stream.read(buffer)
                     if (size <= 0) { Thread.sleep(10); continue }
 
                     sb.append(String(buffer, 0, size, Charsets.US_ASCII))
@@ -932,7 +901,7 @@ class PositionService : Service() {
                             val line = sb.substring(0, end).trim()
                             sb.delete(0, end + 1)
                             if (line.startsWith("$") && line.length > 10) {
-                                AppLogger.d("NMEA_RAW", line)
+                                AppLogger.trace("NMEA_RAW") { line }
                                 if (parseNmeaLine(line)) lastValidSentence = System.currentTimeMillis()
                             }
                         }
@@ -949,15 +918,14 @@ class PositionService : Service() {
                 } catch (e: InterruptedException) {
                     break
                 } catch (e: Exception) {
-                    AppLogger.e(logTag, "Erreur lecture série $path : ${e.message}")
+                    if (serialFileStream === stream) AppLogger.e(logTag, "Erreur lecture série $path : ${e.message}")
                     break
                 }
             }
 
             AppLogger.w(logTag, "Thread lecture série terminé ($path)")
-            try { serialFileStream?.close() } catch (_: Exception) {}
-            serialFileStream = null
-            inputStream = null
+            try { stream.close() } catch (_: Exception) {}
+            if (serialFileStream === stream) serialFileStream = null
 
         }.apply {
             name = "SerialReadThread"
@@ -966,105 +934,75 @@ class PositionService : Service() {
         }
     }
 
-    // ─────────────────────────────────────────────
-    // Parsing NMEA
-    // ─────────────────────────────────────────────
-
-    /** Retourne true si la trame est valide (checksum correct), qu'elle soit exploitée ou non. */
+    /** Retourne true si la trame est valide (checksum présent et correct), qu'elle soit exploitée ou non. */
     private fun parseNmeaLine(line: String): Boolean {
-        if (!line.startsWith("\$")) return false
-        if (line.contains("*") && !verifyNmeaChecksum(line)) {
-            AppLogger.w(logTag, "Checksum invalide: $line")
+        if (!Nmea.verifyChecksum(line)) {
+            AppLogger.w(logTag, "Checksum absent ou invalide: $line")
             return false
         }
-        // En-tête : "$" + talker sur 2 caractères (GP, GN, GL...) + type de trame sur 3 caractères
-        if (line.length < 6) return false
-        when (line.substring(3, 6)) {
-            "GGA" -> parseGga(line)
-            "RMC" -> parseRmc(line)
-            "GST" -> parseGst(line)
+        try {
+            when (Nmea.sentenceType(line)) {
+                "GGA" -> onGga(line)
+                "RMC" -> onRmc(line)
+                "GST" -> onGst(line)
+            }
+        } catch (e: Exception) {
+            AppLogger.e(logTag, "Erreur traitement trame NMEA [${e.javaClass.simpleName}]: ${e.message}")
         }
         return true
     }
 
-    private fun parseGga(line: String) {
-        val parts = (if (line.contains("*")) line.substringBefore("*") else line).split(",")
-        if (parts.size < 10 || parts[2].isEmpty() || parts[4].isEmpty()) return
+    private fun onGga(line: String) {
+        val gga = Nmea.parseGga(line)
+        if (gga == null) {
+            AppLogger.w(logTag, "Trame GGA illisible: $line")
+            return
+        }
+        val label = Nmea.qualityLabel(gga.quality)
+        if (gga.quality != lastGgaQuality) {
+            val previous = lastGgaQuality?.let { Nmea.qualityLabel(it) } ?: "—"
+            AppLogger.i(logTag, "Qualité GNSS : $previous → $label | sats=${gga.satellites} hdop=${gga.hdop}")
+            lastGgaQuality = gga.quality
+        }
+        val lat = gga.latitude ?: return
+        val lon = gga.longitude ?: return
+        if (!gga.hasFix) return
 
-        try {
-            val lat = convertNmeaToDecimal(parts[2], parts[3])
-            val lon = convertNmeaToDecimal(parts[4], parts[5])
-            val quality = parts[6].trim()
-            val numSats = parts[7].trim()
-            val hdop = parts[8].toDoubleOrNull() ?: 0.0
-            val altitude = parts[9].toDoubleOrNull() ?: 0.0
+        val accuracy = estimateAccuracy(gga.quality, gga.hdop)
+        AppLogger.trace(logTag) {
+            "[$label] lat=$lat lon=$lon alt=${gga.altitude}m sats=${gga.satellites} hdop=${gga.hdop} ±${"%.3f".fmt(accuracy)}m"
+        }
 
-            if (quality == "0") {
-                AppLogger.d(logTag, "GGA reçu mais pas de fix (quality=0)")
-                return
-            }
+        updateRtkStatus()
 
-            val accuracy = estimateAccuracy(quality, hdop)
-
-            val qualityLabel = when (quality) {
-                "4" -> "RTK Fix"
-                "5" -> "RTK Float"
-                "2" -> "DGPS"
-                "1" -> "GPS"
-                else -> "Fix=$quality"
-            }
-
-            AppLogger.i(logTag, "[$qualityLabel] lat=$lat lon=$lon alt=${altitude}m sats=$numSats hdop=$hdop ±${"%.3f".fmt(accuracy)}m")
-
-            updateRtkStatus()
-
-            processLocation(
-                PendingLocation(
-                    latitude = lat,
-                    longitude = lon,
-                    altitude = altitude,
-                    accuracy = accuracy,
-                    timestamp = gnssTimestamp(parts[1]),
-                    source = "RTK $qualityLabel",
-                    speed = currentSpeedMs,
-                    heading = currentHeading
-                )
+        processLocation(
+            PendingLocation(
+                latitude = lat,
+                longitude = lon,
+                altitude = gga.altitude,
+                accuracy = accuracy,
+                timestamp = gnssTimestamp(gga.time),
+                source = "RTK $label",
+                speed = currentSpeedMs,
+                heading = currentHeading
             )
-
-        } catch (e: Exception) {
-            AppLogger.e(logTag, "Erreur parsing GGA: ${e.message}")
-        }
+        )
     }
 
-    private fun parseRmc(line: String) {
-        val parts = (if (line.contains("*")) line.substringBefore("*") else line).split(",")
-        if (parts.size < 9) return
-        if (parts[2] != "A") return
-
-        try {
-            val speedKnots = parts[7].toDoubleOrNull() ?: return
-            val heading = parts[8].toDoubleOrNull() ?: 0.0
-            currentSpeedMs = (speedKnots * 0.514444).toFloat()
-            currentHeading = heading.toFloat()
-            val timeOfDay = parseNmeaTimeOfDay(parts[1])
-            val dayStart = if (parts.size > 9) parseNmeaDate(parts[9]) else null
-            if (timeOfDay != null && dayStart != null) {
-                rmcEpochMs = dayStart + timeOfDay
-                rmcReceivedAt = System.currentTimeMillis()
-            }
-            AppLogger.d(logTag, "RMC speed=${"%.2f".fmt(currentSpeedMs)}m/s heading=${"%.1f".fmt(currentHeading)}°")
-        } catch (e: Exception) {
-            AppLogger.e(logTag, "Erreur parsing RMC: ${e.message}")
+    private fun onRmc(line: String) {
+        val rmc = Nmea.parseRmc(line) ?: return
+        currentSpeedMs = rmc.speedMs
+        currentHeading = rmc.heading
+        rmc.epochMs?.let {
+            rmcEpochMs = it
+            rmcReceivedAt = System.currentTimeMillis()
         }
+        AppLogger.trace(logTag) { "RMC speed=${"%.2f".fmt(rmc.speedMs)}m/s heading=${"%.1f".fmt(rmc.heading)}°" }
     }
 
-    /** GST : écarts-types latitude/longitude estimés par le récepteur, en mètres. */
-    private fun parseGst(line: String) {
-        val parts = (if (line.contains("*")) line.substringBefore("*") else line).split(",")
-        if (parts.size < 8) return
-        val latErr = parts[6].toDoubleOrNull() ?: return
-        val lonErr = parts[7].toDoubleOrNull() ?: return
-        gstHorizontalErrorM = sqrt(latErr * latErr + lonErr * lonErr).toFloat()
+    private fun onGst(line: String) {
+        val gst = Nmea.parseGst(line) ?: return
+        gstHorizontalErrorM = gst.horizontalErrorM
         gstReceivedAt = System.currentTimeMillis()
     }
 
@@ -1076,83 +1014,23 @@ class PositionService : Service() {
         if (System.currentTimeMillis() - gstReceivedAt < GST_MAX_AGE_MS && gstHorizontalErrorM > 0f) {
             return gstHorizontalErrorM
         }
-        val typical = when (quality) {
-            "4" -> 0.02f
-            "5" -> 0.30f
-            "2" -> 1.0f
-            else -> 5.0f
-        }
-        return if (hdop > 0.0) typical * hdop.toFloat() else typical
-    }
-
-    /** "hhmmss.ss" → millisecondes depuis minuit UTC. */
-    private fun parseNmeaTimeOfDay(value: String): Long? {
-        if (value.length < 6) return null
-        val hours = value.substring(0, 2).toIntOrNull() ?: return null
-        val minutes = value.substring(2, 4).toIntOrNull() ?: return null
-        val seconds = value.substring(4).toDoubleOrNull() ?: return null
-        if (hours > 23 || minutes > 59 || seconds < 0.0 || seconds >= 61.0) return null
-        return (hours * 3600 + minutes * 60) * 1000L + (seconds * 1000).roundToLong()
-    }
-
-    /** "ddmmyy" → minuit UTC de ce jour, en ms epoch. */
-    private fun parseNmeaDate(value: String): Long? {
-        if (value.length != 6) return null
-        return try {
-            LocalDate.of(
-                2000 + value.substring(4, 6).toInt(),
-                value.substring(2, 4).toInt(),
-                value.substring(0, 2).toInt()
-            ).toEpochDay() * DAY_MS
-        } catch (_: Exception) {
-            null
-        }
+        return Nmea.typicalAccuracy(quality, hdop)
     }
 
     /**
      * Horodatage du fix : heure UTC de la trame GGA (instant de la mesure, et non de la réception),
      * datée par la dernière RMC ou, à défaut, par l'horloge du téléphone.
-     * On retient le jour (veille, même jour ou lendemain) qui place le fix au plus près de la
-     * référence : gère le passage de minuit entre la RMC et la GGA.
      */
     private fun gnssTimestamp(ggaTime: String): Long {
         val now = System.currentTimeMillis()
-        val timeOfDay = parseNmeaTimeOfDay(ggaTime) ?: return now
+        val timeOfDay = Nmea.parseTimeOfDay(ggaTime) ?: return now
         val reference = if (rmcEpochMs > 0L && now - rmcReceivedAt < RMC_DATE_MAX_AGE_MS) {
             rmcEpochMs + (now - rmcReceivedAt)
         } else {
             now
         }
-        val dayStart = Math.floorDiv(reference, DAY_MS) * DAY_MS
-        return listOf(dayStart - DAY_MS, dayStart, dayStart + DAY_MS)
-            .map { it + timeOfDay }
-            .minBy { abs(it - reference) }
+        return Nmea.closestTimestamp(timeOfDay, reference)
     }
-
-    private fun convertNmeaToDecimal(value: String, direction: String): Double {
-        val dotIdx = value.indexOf(".")
-        if (dotIdx < 2) throw IllegalArgumentException("Format NMEA invalide: $value")
-        val degrees = value.substring(0, dotIdx - 2).toDouble()
-        val minutes = value.substring(dotIdx - 2).toDouble()
-        var result = degrees + (minutes / 60.0)
-        if (direction == "S" || direction == "W") result = -result
-        return result
-    }
-
-    private fun verifyNmeaChecksum(sentence: String): Boolean {
-        return try {
-            val start = sentence.indexOf('$') + 1
-            val end = sentence.indexOf('*')
-            if (start < 1 || end < 0 || end <= start || sentence.length < end + 3) return false
-            val data = sentence.substring(start, end)
-            val expected = sentence.substring(end + 1, end + 3).toInt(16)
-            data.fold(0) { acc, c -> acc xor c.code } == expected
-        } catch (_: Exception) { false }
-    }
-
-    // ─────────────────────────────────────────────
-    // Notification
-    // ─────────────────────────────────────────────
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

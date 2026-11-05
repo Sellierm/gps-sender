@@ -1,26 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- ✅ Permissions principales -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
-    <!-- ✅ Localisation -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
 
-    <!-- ✅ Autres permissions nécessaires -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- ✅ WakeLock — evite que Doze/App Standby ne suspende le service pendant
+    <!-- WakeLock : évite que Doze/App Standby ne suspende le service pendant
          les phases de reconnexion serie/socket sur les OEM agressifs -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Exemption d'optimisation de batterie : sans elle, Android 12+ interdit au watchdog
+         de relancer le service depuis l'arrière-plan -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <application
+        android:name=".GpsSenderApp"
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:label="GPS Sender"
@@ -28,7 +29,6 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.GPSSender">
 
-        <!-- ✅ Activité principale -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -38,20 +38,17 @@
             </intent-filter>
         </activity>
 
-        <!-- ✅ Activité de consultation des logs -->
         <activity
             android:name=".LogsActivity"
             android:exported="false"
             android:label="Logs GPS Sender" />
 
-        <!-- ✅ Service de localisation en avant-plan -->
         <service
             android:name=".PositionService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="location|dataSync" />
+            android:foregroundServiceType="location" />
 
-        <!-- ✅ Receiver pour démarrage automatique -->
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"

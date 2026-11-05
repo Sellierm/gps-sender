@@ -11,9 +11,6 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
-/*
- * Gere une connexion Socket.IO persistante pour l'envoi des positions GPS.
- */
 class LocationSocketClient(
     private val deviceId: String,
     private val apiKey: String,

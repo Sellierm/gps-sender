@@ -72,7 +72,7 @@ object AppPreferences {
         getPrefs(context).edit { putString(KEY_DEVICE_ID, id.trim()) }
     }
 
-    // URL et clé serveur : saisies dans l'appli, avec en repli les valeurs optionnelles de local.properties
+    // Repli sur local.properties : builds de debug uniquement (vide en release)
     fun getApiUrl(context: Context): String {
         val saved = getPrefs(context).getString(KEY_API_URL, null)
         if (!saved.isNullOrBlank()) return saved
