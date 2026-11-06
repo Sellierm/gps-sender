@@ -3,6 +3,7 @@ package com.mathieu.gpssender
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.os.Bundle
+import android.view.View
 import android.widget.Button
 import android.widget.ImageButton
 import android.widget.ScrollView
@@ -27,6 +28,9 @@ class LogsActivity : AppCompatActivity(), AppLogger.LogListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_logs)
+        findViewById<View>(R.id.logsRoot).padForSystemBars(horizontal = true)
+        findViewById<View>(R.id.logsHeader).padForSystemBars(top = true)
+        findViewById<View>(R.id.logScrollView).padForSystemBars(bottom = true)
 
         backButton = findViewById(R.id.backButton)
         copyButton = findViewById(R.id.copyButton)
