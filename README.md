@@ -140,6 +140,7 @@ com.mathieu.gpssender
 ├── Nmea.kt                 # Décodage des trames NMEA (GGA, RMC, GST), sans dépendance Android
 ├── PositionService.kt      # Service premier plan (port série, filtrage, lissage, envoi)
 ├── SpeedFilter.kt          # Filtre des positions aberrantes (vitesse apparente > 200 km/h)
+├── SystemBarsPadding.kt    # Place des barres système (affichage bord à bord d'Android 15+)
 ├── UpdateInstallReceiver.kt # Statut de l'installation d'une mise à jour (confirmation, échec)
 ├── UpdateManager.kt        # Mise à jour automatique : vérification, téléchargement, contrôles, installation
 ├── UpdateRules.kt          # Règles pures de la mise à jour (URL, version, empreintes), testées sur JVM
