@@ -13,8 +13,15 @@ class BootReceiver : BroadcastReceiver() {
     private val TAG = "GPS_SENDER_LOG"
 
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
-        AppLogger.d(TAG, "BootReceiver: ACTION_BOOT_COMPLETED reçu.")
+        when (intent.action) {
+            Intent.ACTION_BOOT_COMPLETED -> AppLogger.d(TAG, "BootReceiver: ACTION_BOOT_COMPLETED reçu.")
+            // Après une mise à jour, Android a arrêté le process : on relance le service comme au boot.
+            Intent.ACTION_MY_PACKAGE_REPLACED -> {
+                AppLogger.i(TAG, "BootReceiver: appli mise à jour en ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
+                UpdateManager.onPackageReplaced(context)
+            }
+            else -> return
+        }
 
         if (!AppPreferences.isServiceEnabled(context)) {
             AppLogger.d(TAG, "BootReceiver: service arrêté par l'utilisateur, pas de démarrage.")

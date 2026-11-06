@@ -224,5 +224,58 @@
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            app:cardCornerRadius="12dp"
+            app:cardElevation="4dp"
+            app:cardBackgroundColor="#1E1E1E">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Mises à jour"
+                    android:textSize="18sp"
+                    android:textStyle="bold"
+                    android:textColor="@android:color/white"
+                    android:layout_marginBottom="8dp" />
+
+                <TextView
+                    android:id="@+id/updateStatusText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textColor="#B0BEC5"
+                    android:textSize="14sp"
+                    android:layout_marginBottom="12dp" />
+
+                <Button
+                    android:id="@+id/allowInstallButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="8dp"
+                    android:text="Autoriser l'installation des mises à jour"
+                    android:backgroundTint="#F57C00"
+                    android:textColor="@android:color/white"
+                    android:visibility="gone" />
+
+                <Button
+                    android:id="@+id/checkUpdateButton"
+                    style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Vérifier les mises à jour"
+                    android:textColor="#80CBC4"
+                    app:strokeColor="#80CBC4" />
+
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
     </LinearLayout>
 </ScrollView>
