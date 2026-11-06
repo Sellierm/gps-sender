@@ -12,6 +12,11 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Mise à jour automatique depuis le serveur (UpdateManager) : installation d'un APK,
+         sans confirmation sur Android 12+ quand l'appli se met à jour elle-même -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
+
     <!-- WakeLock : évite que Doze/App Standby ne suspende le service pendant
          les phases de reconnexion serie/socket sur les OEM agressifs -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -55,8 +60,14 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- Relance du service après une mise à jour de l'appli -->
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+
+        <receiver
+            android:name=".UpdateInstallReceiver"
+            android:exported="false" />
 
     </application>
 

@@ -139,14 +139,18 @@ com.mathieu.gpssender
 ├── MainActivity.kt         # Interface utilisateur (champs de réglages, statuts et boutons)
 ├── Nmea.kt                 # Décodage des trames NMEA (GGA, RMC, GST), sans dépendance Android
 ├── PositionService.kt      # Service premier plan (port série, filtrage, lissage, envoi)
-└── SpeedFilter.kt          # Filtre des positions aberrantes (vitesse apparente > 200 km/h)
+├── SpeedFilter.kt          # Filtre des positions aberrantes (vitesse apparente > 200 km/h)
+├── UpdateInstallReceiver.kt # Statut de l'installation d'une mise à jour (confirmation, échec)
+├── UpdateManager.kt        # Mise à jour automatique : vérification, téléchargement, contrôles, installation
+├── UpdateRules.kt          # Règles pures de la mise à jour (URL, version, empreintes), testées sur JVM
+└── UpdateWorker.kt         # Tâche WorkManager : vérification des mises à jour toutes les 6 h
 ```
 
 ---
 
 ## 🧪 Tests
 
-Le décodage NMEA (checksum, coordonnées, passage de minuit, précision) et le filtre de vitesse sont couverts par des tests unitaires JVM :
+Le décodage NMEA (checksum, coordonnées, passage de minuit, précision), le filtre de vitesse et les règles de mise à jour sont couverts par des tests unitaires JVM :
 
 ```bash
 ./gradlew :app:testDebugUnitTest
@@ -173,6 +177,19 @@ Sans ces secrets, la release reste possible à la main via Android Studio (**Bui
 
 ---
 
+## 🔄 Mise à jour automatique des tablettes
+
+Depuis la 2.3.0, l'appli se met à jour seule depuis le serveur Stelleros (même URL, même identifiant et même clé que l'envoi des positions) :
+
+1. Publier la release GitHub (pas en brouillon), puis sur le serveur : `~/stacks/site/app/deploy/publie-gps-sender.sh 2.3.1` (ou le chemin d'un APK signé). Le script vérifie le paquet, la signature, que le `versionCode` augmente et que le certificat n'a pas changé.
+2. Chaque tablette interroge `GET /api/gps-sender/version` au démarrage puis toutes les 6 h (bouton **Vérifier les mises à jour** pour le faire tout de suite). Si la version publiée est plus récente, elle télécharge `GET /api/gps-sender/apk`, contrôle taille, SHA-256, paquet, `versionCode` et certificat, puis l'installe.
+3. Android 12 et plus : installation **sans confirmation** (l'appli se met à jour elle-même). Avant Android 12, ou si le système l'exige, une notification « Mise à jour GPS Sender » attend qu'on la touche (l'écran de confirmation s'ouvre directement si l'appli est au premier plan).
+4. Android relance l'appli après l'installation (`MY_PACKAGE_REPLACED`) : le service redémarre s'il était actif. Les positions en file d'attente sont conservées (SQLite).
+
+Une fois par tablette : autoriser **Installer des applis inconnues** pour GPS Sender (bouton **Autoriser l'installation des mises à jour** de l'écran principal, visible tant que ce n'est pas fait). Android refuse toute mise à jour signée par une autre clé que l'appli installée, et tout retour à une version plus ancienne.
+
+---
+
 ## 🔑 Permissions requises
 
 L'application requiert les permissions Android suivantes :
@@ -183,4 +200,5 @@ L'application requiert les permissions Android suivantes :
 - `android.permission.WAKE_LOCK` : Maintien du processeur éveillé pendant le suivi.
 - `android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` : Demande d'exemption d'optimisation de batterie (relance par le watchdog sur Android 12+).
 - `android.permission.POST_NOTIFICATIONS` : Notification d'état (Android 13+).
+- `android.permission.REQUEST_INSTALL_PACKAGES` & `UPDATE_PACKAGES_WITHOUT_USER_ACTION` : Installation des mises à jour publiées sur le serveur (sans confirmation sur Android 12+).
 - Droits de lecture système sur le périphérique série sélectionné (`/dev/ttyS*` / `/dev/ttyUSB*`).

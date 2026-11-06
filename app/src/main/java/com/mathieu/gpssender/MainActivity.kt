@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.view.View
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.Spinner
@@ -19,7 +20,9 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 import com.google.android.material.textfield.TextInputEditText
+import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
 
@@ -35,6 +38,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var baudRateSpinner: Spinner
     private lateinit var refreshRateSpinner: Spinner
     private lateinit var saveButton: Button
+
+    private lateinit var updateStatusText: TextView
+    private lateinit var allowInstallButton: Button
+    private lateinit var checkUpdateButton: Button
 
     private val TAG = "GPS_SENDER_LOG"
 
@@ -70,6 +77,10 @@ class MainActivity : AppCompatActivity() {
         refreshRateSpinner = findViewById(R.id.refreshRateSpinner)
         saveButton = findViewById(R.id.saveButton)
 
+        updateStatusText = findViewById(R.id.updateStatusText)
+        allowInstallButton = findViewById(R.id.allowInstallButton)
+        checkUpdateButton = findViewById(R.id.checkUpdateButton)
+
         setupSpinners()
         loadPreferences()
 
@@ -79,13 +90,59 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, LogsActivity::class.java))
         }
         saveButton.setOnClickListener { savePreferences() }
+        checkUpdateButton.setOnClickListener { checkForUpdate() }
+        allowInstallButton.setOnClickListener { openInstallPermissionSettings() }
 
         AppLogger.d(TAG, "MainActivity créée et UI initialisée")
     }
 
     override fun onResume() {
         super.onResume()
+        isInForeground = true
         updateStatus()
+        updateUpdateSection()
+    }
+
+    override fun onPause() {
+        isInForeground = false
+        super.onPause()
+    }
+
+    private fun updateUpdateSection() {
+        val allowed = UpdateManager.canInstallPackages(this)
+        updateStatusText.text = buildString {
+            append("Version installée : ${BuildConfig.VERSION_NAME}\n")
+            append(
+                if (allowed) "Mises à jour automatiques depuis le serveur, toutes les 6 h"
+                else "Installation des mises à jour non autorisée : elles attendront une confirmation"
+            )
+        }
+        allowInstallButton.visibility = if (allowed) View.GONE else View.VISIBLE
+    }
+
+    /** « Installer des applis inconnues » pour GPS Sender : nécessaire une fois par tablette. */
+    private fun openInstallPermissionSettings() {
+        try {
+            startActivity(
+                Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, "package:$packageName".toUri())
+            )
+        } catch (e: ActivityNotFoundException) {
+            AppLogger.e(TAG, "Réglage « applis inconnues » introuvable sur cet appareil")
+            Toast.makeText(this, "Réglage introuvable : Paramètres > Applis > GPS Sender", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun checkForUpdate() {
+        checkUpdateButton.isEnabled = false
+        checkUpdateButton.text = "Vérification…"
+        thread(name = "VerifMiseAJour") {
+            val outcome = UpdateManager.checkAndInstall(applicationContext)
+            runOnUiThread {
+                checkUpdateButton.isEnabled = true
+                checkUpdateButton.text = "Vérifier les mises à jour"
+                Toast.makeText(this, outcome.message, Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     private fun setupSpinners() {
@@ -284,6 +341,11 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val STATUS_REFRESH_DELAY_MS = 500L
+
+        /** Au premier plan : l'écran de confirmation d'une mise à jour peut s'ouvrir directement. */
+        @Volatile
+        var isInForeground = false
+            private set
     }
 }
 
