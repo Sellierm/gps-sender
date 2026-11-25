@@ -93,7 +93,16 @@ class LocationSocketClient(
     fun isConnected(): Boolean = socket?.connected() == true
 
     /** Résultat d'un envoi : `rejected` = positions écartées par le serveur car invalides (non renvoyées). */
-    data class BatchResult(val success: Boolean, val rejected: Int = 0, val message: String? = null)
+    data class BatchResult(val success: Boolean, val rejected: Int = 0, val message: String? = null) {
+        companion object {
+            /** Ack du serveur `{ success, accepted, rejected, message }` ; absent ou illisible = échec. */
+            fun fromAck(ack: JSONObject?): BatchResult = BatchResult(
+                success = ack?.optBoolean("success", false) ?: false,
+                rejected = ack?.optInt("rejected", 0) ?: 0,
+                message = ack?.optString("message")?.takeIf { it.isNotEmpty() }
+            )
+        }
+    }
 
     /**
      * Envoie un lot de positions (`location_batch`) et attend l'ack, que le serveur n'envoie
@@ -127,11 +136,6 @@ class LocationSocketClient(
             AppLogger.w(logTag, "Ack non reçu dans le délai (${timeoutMs}ms)")
             return BatchResult(false, message = "timeout")
         }
-        val ack = response.get()
-        return BatchResult(
-            success = ack?.optBoolean("success", false) ?: false,
-            rejected = ack?.optInt("rejected", 0) ?: 0,
-            message = ack?.optString("message")?.takeIf { it.isNotEmpty() }
-        )
+        return BatchResult.fromAck(response.get())
     }
 }

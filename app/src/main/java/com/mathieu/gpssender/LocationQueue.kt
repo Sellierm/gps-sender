@@ -24,8 +24,11 @@ data class QueuedBatch(val lastId: Long, val locations: List<PendingLocation>)
  * Survit à l'arrêt du service par Android et couvre plusieurs heures de coupure réseau :
  * une position n'en sort qu'après l'ack du serveur, qui ne l'envoie qu'une fois écrite en base.
  */
-class LocationQueue(context: Context) :
-    SQLiteOpenHelper(context.applicationContext, "location_queue.db", null, 1) {
+class LocationQueue(
+    context: Context,
+    private val maxSize: Int = MAX_SIZE,
+    private val trimChunk: Int = TRIM_CHUNK
+) : SQLiteOpenHelper(context.applicationContext, "location_queue.db", null, 1) {
 
     companion object {
         // ~8 h à 10 Hz (~25 Mo) ; au-delà, les positions les plus anciennes sont supprimées
@@ -65,12 +68,12 @@ class LocationQueue(context: Context) :
 
     @Synchronized
     fun add(location: PendingLocation) {
-        if (size() >= MAX_SIZE) {
+        if (size() >= maxSize) {
             val removed = writableDatabase.delete(
-                TABLE, "id IN (SELECT id FROM $TABLE ORDER BY id LIMIT $TRIM_CHUNK)", null
+                TABLE, "id IN (SELECT id FROM $TABLE ORDER BY id LIMIT $trimChunk)", null
             )
             cachedSize -= removed
-            AppLogger.w(logTag, "File pleine ($MAX_SIZE) : $removed positions les plus anciennes supprimées")
+            AppLogger.w(logTag, "File pleine ($maxSize) : $removed positions les plus anciennes supprimées")
         }
         val values = ContentValues().apply {
             put("latitude", location.latitude)

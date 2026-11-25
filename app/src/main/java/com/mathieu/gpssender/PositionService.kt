@@ -21,11 +21,9 @@ import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.core.location.LocationManagerCompat
-import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.util.Locale
-import org.json.JSONArray
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import kotlin.math.*
@@ -621,14 +619,13 @@ class PositionService : Service() {
                     // Les positions restent en file jusqu'à l'ack : l'ordre chronologique est préservé
                     // et rien n'est perdu si le service est tué pendant l'envoi.
                     queueSignal.drainPermits()
-                    val batch = locationQueue.peek(BATCH_SIZE)
-                    if (batch == null) {
+                    val outcome = Envoi.sendNext(locationQueue, BATCH_SIZE) { trySendBatch(it) }
+                    if (outcome == Envoi.Resultat.FILE_VIDE) {
                         queueSignal.tryAcquire(1, TimeUnit.SECONDS)
                         continue
                     }
 
-                    if (trySendBatch(batch)) {
-                        locationQueue.removeUpTo(batch.lastId)
+                    if (outcome == Envoi.Resultat.ENVOYE) {
                         consecutiveFailures = 0
                         connectionSignal.drainPermits()
                         val remaining = locationQueue.size()
@@ -637,8 +634,8 @@ class PositionService : Service() {
                         }
                     } else {
                         consecutiveFailures++
-                        // 2, 4, 8 puis 16 s ; une reconnexion du socket écourte l'attente
-                        val delay = 2000L shl minOf(consecutiveFailures - 1, 3)
+                        // Une reconnexion du socket écourte l'attente
+                        val delay = Envoi.retryDelayMs(consecutiveFailures)
                         AppLogger.w(logTag, "Echec envoi ($consecutiveFailures), retry dans ${delay}ms ou dès la reconnexion | file: ${locationQueue.size()}")
                         connectionSignal.tryAcquire(delay, TimeUnit.MILLISECONDS)
                     }
@@ -675,21 +672,7 @@ class PositionService : Service() {
         }
 
         return try {
-            val points = JSONArray()
-            for (pending in batch.locations) {
-                points.put(JSONObject().apply {
-                    put("latitude", pending.latitude)
-                    put("longitude", pending.longitude)
-                    put("altitude", pending.altitude)
-                    put("accuracy", pending.accuracy)
-                    put("speed", pending.speed)
-                    put("heading", pending.heading)
-                    put("timestamp", pending.timestamp)
-                    put("source", pending.source)
-                })
-            }
-
-            val result = client.sendBatch(points)
+            val result = client.sendBatch(Envoi.pointsJson(batch.locations))
             if (result.success) {
                 val last = batch.locations.last()
                 val rejectedInfo = if (result.rejected > 0) " | ${result.rejected} rejetée(s) par le serveur" else ""
