@@ -64,6 +64,10 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+    // Robolectric : SQLite et org.json réels dans les tests unitaires (LocationQueueTest, EnvoiTest)
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+    }
 
 }
 
@@ -77,6 +81,8 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.androidx.work.runtime.ktx)
     testImplementation(libs.junit)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.test.core)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
 }

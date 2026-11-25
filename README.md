@@ -133,6 +133,7 @@ com.mathieu.gpssender
 ├── BootReceiver.kt         # Démarrage automatique du service au boot de l'appareil
 ├── GpsSenderApp.kt         # Application : initialise le journal au démarrage du process
 ├── GpsWatchdogWorker.kt    # Tâche WorkManager pour surveiller et maintenir le service actif
+├── Envoi.kt               # Logique du thread d'envoi (lot, retrait après ack, délais), testée
 ├── LocationQueue.kt        # File d'attente persistante (SQLite) des positions à envoyer
 ├── LocationSocketClient.kt # Client WebSocket persistant Socket.IO (connect, location_batch, ack)
 ├── LogsActivity.kt         # Écran de consultation des logs en direct
@@ -151,7 +152,8 @@ com.mathieu.gpssender
 
 ## 🧪 Tests
 
-Le décodage NMEA (checksum, coordonnées, passage de minuit, précision), le filtre de vitesse et les règles de mise à jour sont couverts par des tests unitaires JVM :
+Le décodage NMEA (checksum, coordonnées, passage de minuit, précision), le filtre de vitesse et les règles de mise à jour sont couverts par des tests unitaires JVM,
+ainsi que la file d'attente SQLite et l'envoi des lots (retrait de la file seulement après l'ack, lecture de l'ack, délais de nouvel essai), via Robolectric :
 
 ```bash
 ./gradlew :app:testDebugUnitTest
